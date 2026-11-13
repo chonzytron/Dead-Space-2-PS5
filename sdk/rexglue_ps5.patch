@@ -564,10 +564,10 @@ index 00000000..85c3c3ca
 +#endif  // __PROSPERO__
 diff --git a/include/rex/ps5_diag.h b/include/rex/ps5_diag.h
 new file mode 100644
-index 00000000..6d0d83bc
+index 00000000..3a40ca42
 --- /dev/null
 +++ b/include/rex/ps5_diag.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,81 @@
 +#pragma once
 +/**
 + * @file        rex/ps5_diag.h
@@ -618,6 +618,13 @@ index 00000000..6d0d83bc
 +// Before the calling thread exits: out of the samples.
 +void UnregisterThread();
 +void SampleAllThreads();
++
++// Where the time goes: every 10 ms each registered thread is asked (SIGPROF)
++// where it is, and every `report_seconds` the log gets, for each thread that
++// used the processor, how much of one core it used and the places it was
++// found at most ("ps5 prof:" lines, addresses as in the stack lines;
++// ps5/tools/ps5_symbolize.py names them). Costs a few percent while it runs.
++void StartProfiler(int report_seconds);
 +
 +// A host fault no handler took (a crash in some thread): the first one is
 +// written to the end of the log file with the thread's return addresses
@@ -2033,19 +2040,24 @@ index d639924c..7f325c0c 100644
  }  // namespace rex::thread
 diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
 new file mode 100644
-index 00000000..0be66022
+index 00000000..74527091
 --- /dev/null
 +++ b/src/core/ps5_diag.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,374 @@
 +// [ps5 port] see rex/ps5_diag.h
 +#include <rex/ps5_diag.h>
 +
 +#if REX_PLATFORM_PS5
 +
++#include <algorithm>
 +#include <cstdio>
 +#include <cstring>
++#include <ctime>
 +#include <mutex>
 +#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
 +
 +#include <fcntl.h>
 +#include <pthread.h>
@@ -2085,6 +2097,11 @@ index 00000000..0be66022
 +  uintptr_t rip = 0, rsp = 0;
 +  uintptr_t words[64] = {};
 +  int nwords = 0;
++  // the profiler's (StartProfiler): where the thread was at the last sample
++  std::atomic<bool> want_prof{false};
++  std::atomic<uint32_t> prof_seq{0};
++  uintptr_t prof_rip = 0, prof_caller = 0;
++  uint64_t prof_cpu_ns = 0;
 +};
 +constexpr int kThreads = 192;
 +ThreadEntry threads[kThreads];
@@ -2104,8 +2121,34 @@ index 00000000..0be66022
 +// rip in its slot 20 and rsp in slot 23.
 +void SampleHandler(int, siginfo_t*, void* uc) {
 +  ThreadEntry* e = my_entry;
-+  if (!e || !e->want_stack.exchange(false, std::memory_order_acq_rel)) return;
++  if (!e) return;
 +  auto* gregs = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(uc) + 64);
++  if (e->want_prof.exchange(false, std::memory_order_acq_rel)) {
++    // The profiler's sample: where the thread is and, when that is outside the
++    // program (the C library, the kernel's, the system's), the nearest return
++    // address into the program on its stack; and the processor time it has used.
++    const uintptr_t rip = gregs[20], rsp = gregs[23];
++    uintptr_t caller = 0;
++    if (!InProgram(rip)) {
++      uintptr_t end = rsp + 4096;
++      if (e->stack_top && e->stack_top < end) end = e->stack_top;
++      for (uintptr_t p = rsp & ~uintptr_t(7); p + 8 <= end; p += 8) {
++        const uintptr_t v = *reinterpret_cast<uintptr_t*>(p);
++        if (InProgram(v)) {
++          caller = v;
++          break;
++        }
++      }
++    }
++    timespec used{};
++    e->prof_cpu_ns = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &used) == 0
++                         ? uint64_t(used.tv_sec) * 1000000000ull + uint64_t(used.tv_nsec)
++                         : 0;
++    e->prof_rip = rip;
++    e->prof_caller = caller;
++    e->prof_seq.fetch_add(1, std::memory_order_release);
++  }
++  if (!e->want_stack.exchange(false, std::memory_order_acq_rel)) return;
 +  e->rip = gregs[20];
 +  e->rsp = gregs[23];
 +  uintptr_t end = e->rsp + 64 * 1024;
@@ -2216,6 +2259,103 @@ index 00000000..0be66022
 +    }
 +    REXLOG_INFO("ps5 stack: tid {} {}: rip {:X} |{}", e.tid, e.what, e.rip - Anchor() + 0x10000000, line);
 +  }
++}
++
++namespace {
++
++// One thread's samples since the last report.
++struct ProfThread {
++  uint32_t seq = 0;
++  uint64_t samples = 0, outside = 0, cpu_ns_at_report = 0, cpu_ns = 0;
++  bool have_cpu = false;
++  // where (program-relative, as logged; for a place outside the program, the
++  // caller in the program with the top bit set) -> times found there
++  std::unordered_map<uint64_t, uint32_t> places;
++};
++
++void ProfilerThread(int report_seconds) {
++  constexpr uint64_t kOutside = 1ull << 63;
++  constexpr int kTop = 14;
++  std::vector<ProfThread> prof(kThreads);
++  uint64_t report_at = NowMs() + uint64_t(report_seconds) * 1000, window_start = NowMs();
++  uint64_t swaps_at_report = Get(kSwaps);
++  REXLOG_INFO("ps5 prof: sampling every 10 ms, a report every {} s; anchor {:X}", report_seconds, Anchor());
++  for (;;) {
++    int count = next_thread.load();
++    if (count > kThreads) count = kThreads;
++    for (int i = 0; i < count; ++i) {
++      ThreadEntry& e = threads[i];
++      if (!e.used.load(std::memory_order_acquire)) continue;
++      e.want_prof.store(true, std::memory_order_release);
++      pthread_kill(e.pthread, SIGPROF);
++    }
++    usleep(10000);
++    for (int i = 0; i < count; ++i) {
++      ThreadEntry& e = threads[i];
++      ProfThread& t = prof[i];
++      const uint32_t seq = e.prof_seq.load(std::memory_order_acquire);
++      if (seq == t.seq) continue;  // (no answer this time: masked, or gone)
++      t.seq = seq;
++      const uintptr_t rip = e.prof_rip, caller = e.prof_caller;
++      t.cpu_ns = e.prof_cpu_ns;
++      if (!t.have_cpu) {
++        t.have_cpu = true;
++        t.cpu_ns_at_report = t.cpu_ns;
++      }
++      ++t.samples;
++      if (InProgram(rip)) {
++        ++t.places[uint64_t(rip - Anchor() + 0x10000000)];
++      } else {
++        ++t.outside;
++        ++t.places[kOutside | (caller ? uint64_t(caller - Anchor() + 0x10000000) : 0)];
++      }
++    }
++    const uint64_t now = NowMs();
++    if (now < report_at) continue;
++    const double seconds = double(now - window_start) / 1000.0;
++    const uint64_t swaps = Get(kSwaps);
++    REXLOG_INFO("ps5 prof: {:.1f} s, {:.1f} frames/s. Per thread: % of one core used, samples, % of them "
++                "outside the program, then place*count (~place: outside the program, called from there)",
++                seconds, double(swaps - swaps_at_report) / seconds);
++    swaps_at_report = swaps;
++    for (int i = 0; i < count; ++i) {
++      ProfThread& t = prof[i];
++      if (!t.samples) continue;
++      const double core = double(t.cpu_ns - t.cpu_ns_at_report) / (seconds * 1e9) * 100.0;
++      // (threads that did next to nothing are left out: the log stays readable)
++      if (core >= 2.0 || !t.cpu_ns) {
++        std::vector<std::pair<uint64_t, uint32_t>> top(t.places.begin(), t.places.end());
++        const size_t keep = std::min<size_t>(top.size(), kTop);
++        std::partial_sort(top.begin(), top.begin() + std::ptrdiff_t(keep), top.end(),
++                          [](const auto& a, const auto& b) { return a.second > b.second; });
++        std::string line;
++        for (size_t k = 0; k < keep; ++k) {
++          char buf[40];
++          std::snprintf(buf, sizeof(buf), " %s%lX*%u", top[k].first & kOutside ? "~" : "",
++                        static_cast<unsigned long>(top[k].first & ~kOutside), top[k].second);
++          line += buf;
++        }
++        REXLOG_INFO("ps5 prof: tid {} {}: core {:.0f}% samples {} outside {:.0f}% |{}", threads[i].tid,
++                    threads[i].what, core, t.samples, 100.0 * double(t.outside) / double(t.samples), line);
++      }
++      t.samples = t.outside = 0;
++      t.cpu_ns_at_report = t.cpu_ns;
++      t.places.clear();
++    }
++    rex::FlushLogging();
++    window_start = NowMs();
++    report_at = window_start + uint64_t(report_seconds) * 1000;
++  }
++}
++
++}  // namespace
++
++void StartProfiler(int report_seconds) {
++  static std::once_flag once;
++  std::call_once(once, [report_seconds] {
++    InstallSampleHandler();
++    std::thread(ProfilerThread, report_seconds < 5 ? 5 : report_seconds).detach();
++  });
 +}
 +
 +void SetLogPath(const char* path) {

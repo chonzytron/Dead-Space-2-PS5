@@ -41,6 +41,11 @@
 # The log (in the app's logs folder): info, debug or trace say more.
 #log_level = "info"
 
+# For performance work: every 30 s the log gets, for each busy thread, how
+# much of a processor core it used and where it spent the time. Slows the
+# game by a few percent while on.
+#ps5_profile = false
+
 # Every 10 s, a line of progress counters in the log, and where every thread
 # is when the game stops drawing. Leave on while the port is young.
 #ps5_diag_monitor = true

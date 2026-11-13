@@ -9,6 +9,12 @@ at a different address on every start). This looks the anchor up in the linked
 program (kept by ps5_package.sh) and prints each such line again with
 function names and, for the recompiled game code, source lines.
 
+The profiler's "ps5 prof: tid" lines (ps5_profile = true in ds2.toml) are
+printed the same way: each place a thread was found at, how often (as a share
+of that thread's samples), and its name. A place marked "~" is outside the
+program (the C library, the system's libraries, the kernel): the name is the
+function in the program that called out. "~0" had no caller in reach.
+
 Needs llvm-nm and llvm-symbolizer (any LLVM; versioned names are found too).
 """
 from __future__ import annotations
@@ -53,6 +59,39 @@ def relative_addresses(line: str) -> list[int]:
     return [v for v in values if 0 < v < 2 * BIAS]
 
 
+def symbolize(symbolizer: str, elf: str, addresses: list[int]) -> list[list[str]]:
+    """The names for each address: the function, then the ones it was inlined into."""
+    if not addresses:
+        return []
+    out = subprocess.run([symbolizer, "-e", elf, "-C", "-p", *[hex(a) for a in addresses]],
+                         capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout.strip():
+        sys.exit(f"{symbolizer} failed: {out.stderr.strip() or 'no output'}")
+    # One block per address, a blank line between them; an inlined function
+    # adds "(inlined by)" lines to its block.
+    blocks = out.stdout.strip("\n").split("\n\n")
+    return [[name.strip() for name in block.splitlines() if name.strip()] or ["??"] for block in blocks]
+
+
+def profile_line(line: str, anchor: int, symbolizer: str, elf: str) -> None:
+    """A "ps5 prof: tid ... | place*count ..." line: the places, most frequent first, with names."""
+    places = re.findall(r"(~?)([0-9A-F]+)\*(\d+)", line.partition("|")[2])
+    samples = re.search(r"samples (\d+)", line)
+    total = int(samples.group(1)) if samples else sum(int(count) for _, _, count in places)
+    known = [(mark, int(value, 16), int(count)) for mark, value, count in places]
+    lookups = [v - BIAS + anchor for _, v, _ in known if v - BIAS + anchor > 0 and v]
+    names = iter(symbolize(symbolizer, elf, lookups))
+    for mark, value, count in known:
+        share = 100.0 * count / total if total else 0.0
+        if not value:
+            print(f"    {share:5.1f}%  ~ outside the program (no caller in reach)")
+            continue
+        block = next(names) if value - BIAS + anchor > 0 else ["??"]
+        print(f"    {share:5.1f}%  {'~ called from ' if mark else ''}{block[0]}")
+        for name in block[1:]:
+            print(f"            {name}")
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print(__doc__)
@@ -62,6 +101,11 @@ def main() -> int:
     text = sys.stdin.read() if log == "-" else open(log, encoding="utf-8", errors="replace").read()
     symbolizer = tool("llvm-symbolizer")
     for line in text.splitlines():
+        if "ps5 prof:" in line:
+            print(line)
+            if "ps5 prof: tid" in line:
+                profile_line(line, anchor, symbolizer, elf)
+            continue
         if "[ps5 crash]" not in line and "ps5 stack:" not in line:
             continue
         print(line)
@@ -72,17 +116,8 @@ def main() -> int:
         values = [v for v in relative_addresses(line) if v - BIAS + anchor > 0]
         if not values:
             continue
-        addresses = [hex(v - BIAS + anchor) for v in values]
-        out = subprocess.run([symbolizer, "-e", elf, "-C", "-p", *addresses], capture_output=True, text=True)
-        if out.returncode != 0 or not out.stdout.strip():
-            print(f"    ({symbolizer} failed: {out.stderr.strip() or 'no output'})")
-            continue
-        # One block per address, a blank line between them; an inlined
-        # function adds "(inlined by)" lines to its block.
-        blocks = out.stdout.strip("\n").split("\n\n")
-        for value, block in zip(values, blocks):
-            names = [name.strip() for name in block.splitlines() if name.strip()]
-            print(f"    {value:X}  {names[0] if names else '??'}")
+        for value, names in zip(values, symbolize(symbolizer, elf, [v - BIAS + anchor for v in values])):
+            print(f"    {value:X}  {names[0]}")
             for name in names[1:]:
                 print(f"        {name}")
     return 0

@@ -51,6 +51,11 @@ REXCVAR_DEFINE_BOOL(ps5_prepare_screen, true, "PS5",
 // A frames-a-second counter in the top right corner of the picture.
 REXCVAR_DEFINE_BOOL(ps5_show_fps, false, "PS5", "Show the game's frames a second in the top right corner");
 
+// For finding what limits the frame rate: where every thread spends its time,
+// in the log every 30 s (rex/ps5_diag.h, StartProfiler). Costs a few percent.
+REXCVAR_DEFINE_BOOL(ps5_profile, false, "PS5",
+                    "Log where each thread spends its time, every 30 s (for performance work)");
+
 extern "C" int sceSystemServiceParamGetInt(int param_id, int* value);
 extern "C" int sceKernelSendNotificationRequest(int, void*, size_t, int);
 
@@ -304,6 +309,7 @@ class Ds2Ps5App : public rex::ReXApp {
 
   void OnPreLaunchModule() override {
     // (here and not earlier: over the game, not over the screens before it)
+    if (REXCVAR_GET(ps5_profile)) rex::ps5diag::StartProfiler(30);
     if (REXCVAR_GET(ps5_show_fps) && imgui_drawer() && !fps_counter_) {
       fps_counter_ = std::make_unique<ds2ps5::FpsCounter>(imgui_drawer());
     }
