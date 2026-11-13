@@ -48,6 +48,9 @@ REXCVAR_DEFINE_STRING(ps5_language, "auto", "PS5",
 REXCVAR_DEFINE_BOOL(ps5_prepare_screen, true, "PS5",
                     "Show a progress screen while the game's files are prepared");
 
+// A frames-a-second counter in the top right corner of the picture.
+REXCVAR_DEFINE_BOOL(ps5_show_fps, false, "PS5", "Show the game's frames a second in the top right corner");
+
 extern "C" int sceSystemServiceParamGetInt(int param_id, int* value);
 extern "C" int sceKernelSendNotificationRequest(int, void*, size_t, int);
 
@@ -113,6 +116,44 @@ class MessageScreen final : public rex::ui::ImGuiDialog {
 
  private:
   std::string title_, body_;
+};
+
+// The frames the game presented in the last half second, as frames a second,
+// in the top right corner (ps5_show_fps). The game's own frames are counted
+// (the ones the log's "ps5 diag" line counts), not the TV's refreshes.
+class FpsCounter final : public rex::ui::ImGuiDialog {
+ public:
+  explicit FpsCounter(rex::ui::ImGuiDrawer* drawer)
+      : rex::ui::ImGuiDialog(drawer),
+        frames_(rex::ps5diag::Get(rex::ps5diag::kSwaps)),
+        since_ms_(rex::ps5diag::NowMs()) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    const uint64_t now_ms = rex::ps5diag::NowMs();
+    if (now_ms - since_ms_ >= 500) {
+      const uint64_t frames = rex::ps5diag::Get(rex::ps5diag::kSwaps);
+      fps_ = double(frames - frames_) * 1000.0 / double(now_ms - since_ms_);
+      frames_ = frames;
+      since_ms_ = now_ms;
+    }
+    // (sized for the TV as the other screens are, and in from the corner: TVs crop the edge)
+    const float scale = io.DisplaySize.y > 0 ? io.DisplaySize.y / 540.0f : 2.0f;
+    const float margin = io.DisplaySize.y * 0.03f;
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, margin), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.4f);
+    ImGui::Begin("##ds2ps5-fps", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::SetWindowFontScale(scale * 0.8f);
+    ImGui::Text("%.0f FPS", fps_);
+    ImGui::End();
+  }
+
+ private:
+  uint64_t frames_, since_ms_;
+  double fps_ = 0.0;
 };
 
 // What is shown while the game's files are looked through and prepared: what
@@ -258,7 +299,14 @@ class Ds2Ps5App : public rex::ReXApp {
                 files_.iso[boot - 1].string(), game_data_root().string(), xex_image);
   }
 
+  // Before the overlay drawer goes: a dialog takes itself off it when destroyed.
+  void OnShutdown() override { fps_counter_.reset(); }
+
   void OnPreLaunchModule() override {
+    // (here and not earlier: over the game, not over the screens before it)
+    if (REXCVAR_GET(ps5_show_fps) && imgui_drawer() && !fps_counter_) {
+      fps_counter_ = std::make_unique<ds2ps5::FpsCounter>(imgui_drawer());
+    }
     try {
       ds2::disc_swap::RegisterImport(*runtime());
     } catch (const std::exception& error) {
@@ -279,6 +327,7 @@ class Ds2Ps5App : public rex::ReXApp {
 
   ds2ps5::GameFiles files_;
   std::unique_ptr<Prepare> prepare_;
+  std::unique_ptr<ds2ps5::FpsCounter> fps_counter_;
 
   static void* PrepareThread(void* argument) {
     auto* prepare = static_cast<Prepare*>(argument);

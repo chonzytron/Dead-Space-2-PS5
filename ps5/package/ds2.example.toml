@@ -17,6 +17,9 @@
 # 60 when it is over. false: 60 in cutscenes too.
 #ps5_cutscenes_30 = true
 
+# A frames-a-second counter in the top right corner of the picture.
+#ps5_show_fps = false
+
 # The TV mode the picture is sent in: 2160 (4K) or 1080. The game itself is
 # drawn at the Xbox 360's 1280x720 and scaled up to it.
 #ps5_display_height = 2160
