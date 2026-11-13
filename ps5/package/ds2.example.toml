@@ -17,6 +17,12 @@
 # 60 when it is over. false: 60 in cutscenes too.
 #ps5_cutscenes_30 = true
 
+# Adaptive vsync: a frame that is a little late is shown as soon as it is
+# ready. false is the Xbox 360's way: it waits for the next refresh, so a
+# frame that takes 17 ms is shown after 33 and 60 frames a second become 30.
+# Set false if the game's speed or its motion seems wrong.
+#vsync_adaptive = true
+
 # A frames-a-second counter in the top right corner of the picture.
 #ps5_show_fps = false
 

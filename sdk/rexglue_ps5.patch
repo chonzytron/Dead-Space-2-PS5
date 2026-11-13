@@ -344,6 +344,61 @@ index 00000000..87e2fd2e
 +}  // namespace rex::filesystem::direct
 +
 +#endif  // !_WIN32
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056e..5077020f 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -14,6 +14,8 @@
+ #include "rex/system/function_dispatcher.h"
+ 
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -77,6 +79,26 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+ 
++  // [ps5 port] Adaptive vsync (the vsync_adaptive setting).
++  //
++  // The game's D3D holds each frame at a WAIT_REG_MEM until its vblank
++  // interrupt lets it go, so a frame that isn't ready for a vblank waits a
++  // whole one more: 17 ms of work is shown after 33, and 60 frames a second
++  // become 30. The vblank here is a timer of ours, not the TV's (the picture
++  // reaches the TV through the presenter, at the TV's own pace), so it can
++  // come when the late frame is ready: when the command processor starts
++  // waiting and a vblank has gone by since its last wait ended, the vblank
++  // thread gives one at once and counts its interval on from there. A frame
++  // that is early still waits for its vblank: never more than one frame per
++  // interval.
++  //
++  // The command processor says when it waits:
++  uint64_t vblank_serial() const { return vblank_serial_.load(std::memory_order_acquire); }
++  void BeginSwapWait();
++  void EndSwapWait();
++  // Until a vblank after `serial_seen` has been given, or for `timeout`.
++  void WaitForVblankAfter(uint64_t serial_seen, std::chrono::milliseconds timeout);
++
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
+@@ -120,6 +142,14 @@ class GraphicsSystem : public system::IGraphicsSystem {
+ 
+   std::atomic<bool> vsync_worker_running_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
++  // [ps5 port] adaptive vsync
++  std::mutex vsync_mutex_;
++  std::condition_variable vsync_wake_, vblank_given_;
++  bool vsync_wake_requested_ = false;                      // (under vsync_mutex_)
++  std::atomic<bool> swap_waiting_{false};
++  std::atomic<uint64_t> swap_wait_serial_{0};              // the wait going on, or the last one
++  std::atomic<uint64_t> vblank_serial_{0};                 // vblanks given
++  std::atomic<uint64_t> swap_release_vblank_serial_{0};    // vblank_serial_ when the last wait ended
+ 
+   RegisterFile register_file_;
+   std::unique_ptr<CommandProcessor> command_processor_;
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
 index d26cd4fb..fffad831 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
@@ -2040,7 +2095,7 @@ index d639924c..7f325c0c 100644
  }  // namespace rex::thread
 diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
 new file mode 100644
-index 00000000..74527091
+index 00000000..8605b8f4
 --- /dev/null
 +++ b/src/core/ps5_diag.cpp
 @@ -0,0 +1,374 @@
@@ -2275,7 +2330,7 @@ index 00000000..74527091
 +
 +void ProfilerThread(int report_seconds) {
 +  constexpr uint64_t kOutside = 1ull << 63;
-+  constexpr int kTop = 14;
++  constexpr size_t kTop = 14, kTopBusy = 40;  // (more for a thread that used half a core)
 +  std::vector<ProfThread> prof(kThreads);
 +  uint64_t report_at = NowMs() + uint64_t(report_seconds) * 1000, window_start = NowMs();
 +  uint64_t swaps_at_report = Get(kSwaps);
@@ -2325,7 +2380,7 @@ index 00000000..74527091
 +      // (threads that did next to nothing are left out: the log stays readable)
 +      if (core >= 2.0 || !t.cpu_ns) {
 +        std::vector<std::pair<uint64_t, uint32_t>> top(t.places.begin(), t.places.end());
-+        const size_t keep = std::min<size_t>(top.size(), kTop);
++        const size_t keep = std::min<size_t>(top.size(), core >= 50.0 ? kTopBusy : kTop);
 +        std::partial_sort(top.begin(), top.begin() + std::ptrdiff_t(keep), top.end(),
 +                          [](const auto& a, const auto& b) { return a.second > b.second; });
 +        std::string line;
@@ -2604,7 +2659,7 @@ index fd06c662..140a0042 100644
    return value;
  }
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index bed1e59c..d953b3ea 100644
+index bed1e59c..90d66b44 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -66,7 +66,9 @@ uint32_t NxKernelPriority() {
@@ -2751,7 +2806,23 @@ index bed1e59c..d953b3ea 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
-@@ -694,11 +769,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -457,8 +532,13 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // [ps5 port] The time left, not its whole milliseconds: with under a
++        // millisecond to go (every alertable wait: it comes here a millisecond
++        // at a time) that was 0, and the loop span through the whole wait
++        // without sleeping. The game's audio thread, which waits on nine
++        // handles, used three quarters of a core that way.
++        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(end_time - now);
++        auto sleep_time = std::min(remaining, std::chrono::microseconds(1000));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+@@ -694,11 +774,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
      pthread_attr_t attr;
      if (pthread_attr_init(&attr) != 0)
        return false;
@@ -2780,7 +2851,7 @@ index bed1e59c..d953b3ea 100644
        sched_param sched{};
        sched.sched_priority = params.initial_priority + 1;
        if (pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != 0) {
-@@ -710,7 +801,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -710,7 +806,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -2797,7 +2868,7 @@ index bed1e59c..d953b3ea 100644
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -726,6 +825,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -726,6 +830,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
          exit_code_(0),
          state_(State::kRunning),
          suspend_count_(0) {
@@ -2808,7 +2879,7 @@ index bed1e59c..d953b3ea 100644
  #if defined(__APPLE__)
      suspend_sem_ = RexCreateAnonymousSemaphore();
  #else
-@@ -761,6 +864,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -761,6 +869,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
          std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
          rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
        }
@@ -2817,7 +2888,7 @@ index bed1e59c..d953b3ea 100644
  #else
        if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
          assert_always();
-@@ -779,6 +884,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -779,6 +889,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
        if (pthread_equal(thread_, pthread_self())) {
          pthread_setname_np(std::string(name).c_str());
        }
@@ -2826,7 +2897,7 @@ index bed1e59c..d953b3ea 100644
  #else
        pthread_setname_np(thread_, std::string(name).c_str());
  #endif
-@@ -810,13 +917,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -810,13 +922,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
  #if defined(__APPLE__)
    uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
@@ -2844,7 +2915,7 @@ index bed1e59c..d953b3ea 100644
      // macOS doesn't expose Linux-style pthread affinity masks; report every
      // logical processor as available.
      auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
-@@ -847,7 +957,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -847,7 +962,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_affinity_mask(uint64_t mask) {
      WaitStarted();
@@ -2853,7 +2924,7 @@ index bed1e59c..d953b3ea 100644
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
      (void)mask;
-@@ -885,8 +995,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -885,8 +1000,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_priority(int new_priority) {
      WaitStarted();
@@ -2866,7 +2937,7 @@ index bed1e59c..d953b3ea 100644
      return;
  #endif
      sched_param param{};
-@@ -924,7 +1036,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -924,7 +1041,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -2875,7 +2946,7 @@ index bed1e59c..d953b3ea 100644
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -1037,6 +1149,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1037,6 +1154,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
        cond_.notify_all();
      }
      if (is_current_thread) {
@@ -2885,7 +2956,7 @@ index bed1e59c..d953b3ea 100644
        pthread_exit(reinterpret_cast<void*>(exit_code));
      } else {
  #if REX_PLATFORM_ANDROID
-@@ -1071,7 +1186,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1071,7 +1191,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
    inline bool signaled() const override { return signaled_; }
    inline void post_execution() override {
      if (thread_) {
@@ -2900,7 +2971,7 @@ index bed1e59c..d953b3ea 100644
      }
  #if defined(__APPLE__)
      if (suspend_sem_ != SEM_FAILED) {
-@@ -1085,6 +1207,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1085,6 +1212,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
    pthread_t thread_;
  #if REX_PLATFORM_NX
    nn::os::ThreadType* nn_thread_ = nullptr;  // N4: set by ThreadStartRoutine before start is published
@@ -2912,7 +2983,7 @@ index bed1e59c..d953b3ea 100644
  #endif
    bool signaled_;
    int exit_code_;
-@@ -1481,6 +1608,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1481,6 +1613,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
  
    current_thread_ = thread;
    current_thread_condition_ = &thread->handle_;
@@ -2923,7 +2994,7 @@ index bed1e59c..d953b3ea 100644
  #if REX_PLATFORM_NX
    thread->handle_.nn_thread_ = nn::os::GetCurrentThread();
    if (NxPrioEnabled()) {
-@@ -1515,6 +1646,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1515,6 +1651,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
    }
  
    start_routine();
@@ -2933,7 +3004,7 @@ index bed1e59c..d953b3ea 100644
  
    {
      std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-@@ -1588,6 +1722,8 @@ void Thread::Exit(int exit_code) {
+@@ -1588,6 +1727,8 @@ void Thread::Exit(int exit_code) {
  void set_current_thread_name(const std::string_view name) {
  #if defined(__APPLE__)
    pthread_setname_np(std::string(name).c_str());
@@ -3174,7 +3245,7 @@ index 0d8f8af0..e75b77f4 100644
  
  set_target_properties(rexgpu-xenos PROPERTIES
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 2266c728..dd156125 100644
+index 2266c728..15eb5729 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -3201,8 +3272,42 @@ index 2266c728..dd156125 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
+@@ -1022,8 +1025,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
++  // [ps5 port] Told to the vblank thread while this waits (adaptive vsync,
++  // rex/graphics/graphics_system.h), and the wait itself ends with the vblank
++  // instead of up to a millisecond after it.
++  struct SwapWait {
++    GraphicsSystem* graphics_system = nullptr;
++    ~SwapWait() {
++      if (graphics_system) graphics_system->EndSwapWait();
++    }
++  } swap_wait;
++
+   bool matched = false;
+   do {
++    const uint64_t vblank_serial_seen = graphics_system_ ? graphics_system_->vblank_serial() : 0;
+     uint32_t value = 0;
+     if (is_memory) {
+       value =
+@@ -1069,6 +1083,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
++        } else if (graphics_system_) {
++          if (!swap_wait.graphics_system) {
++            swap_wait.graphics_system = graphics_system_;
++            graphics_system_->BeginSwapWait();
++          }
++          graphics_system_->WaitForVblankAfter(vblank_serial_seen,
++                                               std::chrono::milliseconds(wait / 0x100));
+         } else {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0b..d95eff1d 100644
+index 8f2fcb0b..9eb6ef73 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -10,6 +10,7 @@
@@ -3213,7 +3318,68 @@ index 8f2fcb0b..d95eff1d 100644
  
  #include <algorithm>
  #include <cctype>
-@@ -298,6 +299,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -35,6 +36,16 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// [ps5 port] rex/graphics/graphics_system.h, "Adaptive vsync".
++#if REX_PLATFORM_PS5
++#define REX_VSYNC_ADAPTIVE_DEFAULT true
++#else
++#define REX_VSYNC_ADAPTIVE_DEFAULT false
++#endif
++REXCVAR_DEFINE_BOOL(vsync_adaptive, REX_VSYNC_ADAPTIVE_DEFAULT, "GPU",
++                    "With vsync: a frame that missed its vblank is shown when it is ready, not a "
++                    "whole vblank later");
++
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+@@ -158,15 +169,42 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        uint64_t early_given_for_wait = 0;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          bool given = false;
++          // [ps5 port] Adaptive vsync: a frame is waiting for a vblank and one
++          // has gone by since the last frame was let go, so this one is late.
++          // It gets its vblank now (once), and the interval counts from here.
++          if (REXCVAR_GET(vsync) && REXCVAR_GET(vsync_adaptive) &&
++              swap_waiting_.load(std::memory_order_acquire)) {
++            const uint64_t wait_serial = swap_wait_serial_.load(std::memory_order_acquire);
++            if (wait_serial != early_given_for_wait &&
++                vblank_serial_.load(std::memory_order_acquire) !=
++                    swap_release_vblank_serial_.load(std::memory_order_acquire)) {
++              early_given_for_wait = wait_serial;
++              MarkVblank();
++              last_frame_time = current_time;
++              given = true;
++            }
++          }
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
+             last_frame_time += interval_ticks;
++            given = true;
++          }
++          if (given) {
++            // (a waiting command processor looks again at once)
++            std::lock_guard<std::mutex> lock(vsync_mutex_);
++            vblank_given_.notify_all();
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
++          // A millisecond, or less when a frame starts waiting.
++          std::unique_lock<std::mutex> lock(vsync_mutex_);
++          vsync_wake_.wait_for(lock, std::chrono::milliseconds(1),
++                               [this] { return vsync_wake_requested_; });
++          vsync_wake_requested_ = false;
+         }
+         return 0;
+       }));
+@@ -298,6 +336,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
    if (!interrupt_callback_) {
      return;
    }
@@ -3221,7 +3387,32 @@ index 8f2fcb0b..d95eff1d 100644
  
    auto thread = system::XThread::GetCurrentThread();
    assert_not_null(thread);
-@@ -320,6 +322,7 @@ void GraphicsSystem::MarkVblank() {
+@@ -316,10 +355,32 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+                                          rex::countof(args));
+ }
+ 
++void GraphicsSystem::BeginSwapWait() {
++  swap_wait_serial_.fetch_add(1, std::memory_order_acq_rel);
++  swap_waiting_.store(true, std::memory_order_release);
++  std::lock_guard<std::mutex> lock(vsync_mutex_);
++  vsync_wake_requested_ = true;
++  vsync_wake_.notify_one();
++}
++
++void GraphicsSystem::EndSwapWait() {
++  swap_release_vblank_serial_.store(vblank_serial_.load(std::memory_order_acquire),
++                                    std::memory_order_release);
++  swap_waiting_.store(false, std::memory_order_release);
++}
++
++void GraphicsSystem::WaitForVblankAfter(uint64_t serial_seen, std::chrono::milliseconds timeout) {
++  std::unique_lock<std::mutex> lock(vsync_mutex_);
++  vblank_given_.wait_for(lock, timeout, [this, serial_seen] {
++    return vblank_serial_.load(std::memory_order_acquire) != serial_seen;
++  });
++}
++
+ void GraphicsSystem::MarkVblank() {
    // TODO: Enable profiling once ported
    // SCOPE_profile_cpu_f("gpu");
  
@@ -3229,6 +3420,16 @@ index 8f2fcb0b..d95eff1d 100644
    // Increment vblank counter (so the game sees us making progress).
    if (command_processor_) {
      command_processor_->increment_counter();
+@@ -329,6 +390,9 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   DispatchInterruptCallback(0, 2);
++  // [ps5 port] (after the game's interrupt handler ran: whoever waits for this
++  // vblank finds what the handler did)
++  vblank_serial_.fetch_add(1, std::memory_order_acq_rel);
+ }
+ 
+ void GraphicsSystem::ClearCaches() {
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 76f5600c..989fc100 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
