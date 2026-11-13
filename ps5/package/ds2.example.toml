@@ -21,6 +21,11 @@
 # less delay between picture and sound, but may crackle.
 #audio_maxqframes = 8
 
+# The progress screen of the first start, while the game's files are prepared
+# (unpacking Severed takes a few minutes). false: no screen, only a PS5
+# notification; try it if the app stays black and never reaches the game.
+#ps5_prepare_screen = true
+
 # The log (in the app's logs folder): info, debug or trace say more.
 #log_level = "info"
 

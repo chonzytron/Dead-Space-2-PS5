@@ -67,13 +67,24 @@ def main() -> int:
         print(line)
         if "ps5 stack: anchor" in line:
             continue
-        values = relative_addresses(line)
+        # (a stack also holds numbers that are no code address: one below the
+        # program's start would be a negative address, which stops the symbolizer)
+        values = [v for v in relative_addresses(line) if v - BIAS + anchor > 0]
         if not values:
             continue
         addresses = [hex(v - BIAS + anchor) for v in values]
         out = subprocess.run([symbolizer, "-e", elf, "-C", "-p", *addresses], capture_output=True, text=True)
-        for value, name in zip(values, out.stdout.strip().splitlines()):
-            print(f"    {value:X}  {name}")
+        if out.returncode != 0 or not out.stdout.strip():
+            print(f"    ({symbolizer} failed: {out.stderr.strip() or 'no output'})")
+            continue
+        # One block per address, a blank line between them; an inlined
+        # function adds "(inlined by)" lines to its block.
+        blocks = out.stdout.strip("\n").split("\n\n")
+        for value, block in zip(values, blocks):
+            names = [name.strip() for name in block.splitlines() if name.strip()]
+            print(f"    {value:X}  {names[0] if names else '??'}")
+            for name in names[1:]:
+                print(f"        {name}")
     return 0
 
 

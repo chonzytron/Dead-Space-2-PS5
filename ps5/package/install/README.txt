@@ -14,9 +14,11 @@ What goes in this folder (any file names, sub-folders are looked through too):
      (Content/0000000000000000/454108DF/00000002/ on its drive).
 
 Then start the app. The first start checks the files against the ones this
-build was made from and gets the game ready (a few seconds; Severed takes
-longer). The disc images have to stay here: the game reads its data straight
-from them. The title update and Severed packages can be deleted afterwards.
+build was made from and gets the game ready: a few seconds, or a few minutes
+with Severed, which is unpacked (about 1 GB). The screen says how far it is.
+If the app is closed meanwhile, the next start goes on from there. The disc
+images have to stay here: the game reads its data straight from them. The
+title update and Severed packages can be deleted afterwards.
 
 If something is missing or isn't the right release, the app says so on screen.
 

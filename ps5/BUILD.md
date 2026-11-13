@@ -78,7 +78,9 @@ repository alone, started from a branch that contains it.
 Everything is in the app's folder, `/data/homebrew/PPSA94108/`:
 
 - `install/`: your Disc 1 image (and Disc 2), Title Update #2, optionally Severed
-  (`install/README.txt` says exactly what). The first start prepares the game from them.
+  (`install/README.txt` says exactly what). The first start prepares the game from them, with
+  a screen that says how far it is: a few seconds, or a few minutes when Severed is unpacked
+  (about 1 GB). Closed meanwhile, the next start goes on from where that one stopped.
 - `game/`: `default.xex` and the Title Update #2 patch per disc, taken from your files.
 - `UserData/`: saves, installed DLC, the shader and pipeline caches.
 - `ds2.toml`: settings (copy `ds2.example.toml`).
@@ -106,8 +108,9 @@ python3 ps5/tools/ps5_symbolize.py out/ps5/ps5-link/build/llvm-pie.elf ds2_001.l
 | `sdk/rexglue_ps5.patch` | the PS5 platform layer for ReXGlue v0.10.0, on top of `sdk/rexglue_ds2.patch` |
 | `sdk/ffmpeg_ps5.patch` | FFmpeg's build configuration for the PS5 (from the GTA IV port) |
 | `ps5/CMakeLists.txt`, `ps5/cmake/` | the build: SDK, recompiled game and app as one static program |
-| `ps5/src/ds2_ps5_app.h` | the app: start-up settings, the missing-files screen, disc mounting |
+| `ps5/src/ds2_ps5_app.h` | the app: start-up settings, the preparing and missing-files screens, disc mounting |
 | `ps5/src/ds2_ps5_install.*` | finding and preparing the game from the player's files |
+| `ps5/src/ds2_ps5_io.h` | unpacking past the PS5's file cache (`ps5/tests/ps5_io_test.cpp` runs it on Linux) |
 | `ps5/src/ds2_ps5_pch.h` | the recompiled code's precompiled header with the PS5's memory offset |
 | `ps5/tools/` | SDK fetch, link and packaging, log symbolizer |
 | `ps5/package/` | home screen icon, `install/README.txt`, the settings template |
