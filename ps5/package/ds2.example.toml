@@ -9,9 +9,13 @@
 #ps5_language = "auto"          # auto, english, french, spanish
 
 # Frames a second the game aims for: 60, or 30, the game as it shipped on the
-# Xbox 360. At 60 some cutscene animation isn't quite right (as in the PC
-# release); set 30 if something looks or plays wrong.
+# Xbox 360. Set 30 if something looks or plays wrong at 60.
 #ps5_frame_rate = 60
+
+# At 60, some cutscene animation isn't quite right (as in the PC release), so
+# the game goes back to its own 30 while a cutscene has hold of Isaac, and to
+# 60 when it is over. false: 60 in cutscenes too.
+#ps5_cutscenes_30 = true
 
 # The TV mode the picture is sent in: 2160 (4K) or 1080. The game itself is
 # drawn at the Xbox 360's 1280x720 and scaled up to it.

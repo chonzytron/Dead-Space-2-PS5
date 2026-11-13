@@ -38,8 +38,8 @@ PS5 Vulkan driver, one static program in `/data/homebrew/`.
 - **Controls:** Cross/Circle/Square/Triangle are A/B/X/Y, L1/R1 the bumpers, L2/R2 the triggers,
   Options is START, the touchpad click is BACK. Rumble goes to the DualSense.
 - **The picture:** the game is drawn at the Xbox 360's 1280x720 and scaled to the TV's 4K or 1080p
-  mode, at 60 FPS (the PC build's `framerate` mod, built in); `ps5_frame_rate = 30` in `ds2.toml` is
-  the game's own 30. `resolution_scale` there raises the internal resolution (untested on the PS5).
+  mode, at 60 FPS (the PC build's `framerate` mod, built in) and the game's own 30 in cutscenes;
+  `ps5_frame_rate = 30` in `ds2.toml` is 30 throughout. `resolution_scale` there raises the internal resolution (untested on the PS5).
 - **Build and logs:** [ps5/BUILD.md](ps5/BUILD.md).
 
 ## Status

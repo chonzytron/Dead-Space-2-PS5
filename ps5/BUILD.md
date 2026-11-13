@@ -110,7 +110,7 @@ python3 ps5/tools/ps5_symbolize.py out/ps5/ps5-link/build/llvm-pie.elf ds2_001.l
 | `ps5/CMakeLists.txt`, `ps5/cmake/` | the build: SDK, recompiled game and app as one static program |
 | `ps5/src/ds2_ps5_app.h` | the app: start-up settings, the preparing and missing-files screens, disc mounting |
 | `ps5/src/ds2_ps5_install.*` | finding and preparing the game from the player's files |
-| `ps5/src/ds2_ps5_framerate.cpp` | 60 FPS: the PC `framerate` mod's two hooks, as the `ps5_frame_rate` setting |
+| `ps5/src/ds2_ps5_framerate.cpp` | 60 FPS: the PC `framerate` mod's two hooks, as the `ps5_frame_rate` setting, and 30 in cutscenes (`ps5_cutscenes_30`) |
 | `ps5/src/ds2_ps5_io.h` | unpacking past the PS5's file cache (`ps5/tests/ps5_io_test.cpp` runs it on Linux) |
 | `ps5/src/ds2_ps5_pch.h` | the recompiled code's precompiled header with the PS5's memory offset |
 | `ps5/tools/` | SDK fetch, link and packaging, log symbolizer |
