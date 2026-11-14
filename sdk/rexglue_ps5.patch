@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9b3cdf56..13f6998a 100644
+index 9b3cdf56..28584620 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -116,7 +116,9 @@ endfunction()
@@ -13,10 +13,17 @@ index 9b3cdf56..13f6998a 100644
          # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
          # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
          # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
-@@ -167,6 +169,12 @@ elseif(UNIX AND NOT APPLE)
+@@ -167,6 +169,19 @@ elseif(UNIX AND NOT APPLE)
          set(REX_PLATFORM "linux-${REX_TARGET_PROCESSOR}")
      endif()
      add_compile_definitions(REX_PLATFORM_LINUX=1)
++    # [ps5 port] The PS5 program built for Linux, to test it on a PC: one
++    # static program as on the PS5 (the GPU backend linked in, not a plugin),
++    # and the PS5's diagnostics and profiler (rex/ps5_diag.h) in it.
++    option(REXGLUE_PS5_LINUX_TEST "Build as the PS5 program does, for Linux" OFF)
++    if(REXGLUE_PS5_LINUX_TEST AND NOT PS5)
++        add_compile_definitions(REX_PS5_LINUX_TEST=1)
++    endif()
 +    if(PS5)
 +        # [ps5 port] PS5 homebrew: FreeBSD-based, shares the POSIX paths.
 +        set(REX_PLATFORM "ps5-amd64")
@@ -830,7 +837,7 @@ index 00000000..870db03b
 +
 +}  // namespace rex::input::ps5
 diff --git a/include/rex/platform.h b/include/rex/platform.h
-index 577a92a0..2ece8d50 100644
+index 577a92a0..eedce17a 100644
 --- a/include/rex/platform.h
 +++ b/include/rex/platform.h
 @@ -41,6 +41,11 @@
@@ -845,12 +852,21 @@ index 577a92a0..2ece8d50 100644
  #else
  #error Unsupported target OS.
  #endif
-@@ -65,6 +70,9 @@
+@@ -65,6 +70,18 @@
  #ifndef REX_PLATFORM_NX
  #define REX_PLATFORM_NX 0
  #endif
 +#ifndef REX_PLATFORM_PS5
 +#define REX_PLATFORM_PS5 0
++#endif
++// [ps5 port] The PS5 program: on the PS5, or built for Linux to test it on a
++// PC (REXGLUE_PS5_LINUX_TEST). Its diagnostics and profiler (rex/ps5_diag.h),
++// the GPU backend linked in, the PS5's defaults. What only the console has
++// stays under REX_PLATFORM_PS5.
++#if REX_PLATFORM_PS5 || defined(REX_PS5_LINUX_TEST)
++#define REX_PS5_PROGRAM 1
++#else
++#define REX_PS5_PROGRAM 0
 +#endif
  
  #if defined(__clang__)
@@ -918,7 +934,7 @@ index 00000000..85c3c3ca
 +#endif  // __PROSPERO__
 diff --git a/include/rex/ps5_diag.h b/include/rex/ps5_diag.h
 new file mode 100644
-index 00000000..fca0e473
+index 00000000..0ba6cab1
 --- /dev/null
 +++ b/include/rex/ps5_diag.h
 @@ -0,0 +1,88 @@
@@ -955,7 +971,7 @@ index 00000000..fca0e473
 +  kCount
 +};
 +
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +extern std::atomic<uint64_t> counters[kCount];
 +inline void Add(Counter c) { counters[c].fetch_add(1, std::memory_order_relaxed); }
 +inline uint64_t Get(Counter c) { return counters[c].load(std::memory_order_relaxed); }
@@ -1636,10 +1652,10 @@ index 68da0cf9..1de6aa46 100644
    assert_not_null(sdldriver);
    sdldriver->Shutdown();
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 1ddafd08..3903365d 100644
+index 1ddafd08..be9282b6 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
-@@ -98,7 +98,11 @@ target_include_directories(rexcore PRIVATE
+@@ -98,10 +98,17 @@ target_include_directories(rexcore PRIVATE
      ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
  )
  
@@ -1652,6 +1668,12 @@ index 1ddafd08..3903365d 100644
      target_link_libraries(rexcore PRIVATE pthread)
  elseif(UNIX)
      target_link_libraries(rexcore PRIVATE pthread rt dl)
++    if(REXGLUE_PS5_LINUX_TEST)
++        target_sources(rexcore PRIVATE ps5_diag.cpp)  # [ps5 port] Linux test build
++    endif()
+ endif()
+ 
+ target_link_libraries(rexcore
 diff --git a/src/core/clock.cpp b/src/core/clock.cpp
 index ae72b7ae..3c5525e3 100644
 --- a/src/core/clock.cpp
@@ -2080,25 +2102,23 @@ index ef5bdf4e..55daeaf3 100644
    if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
      return std::filesystem::path(*xdg);
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
-index 1645848c..c4cb3952 100644
+index 1645848c..0958a7f5 100644
 --- a/src/core/logging.cpp
 +++ b/src/core/logging.cpp
-@@ -25,6 +25,10 @@
+@@ -25,6 +25,8 @@
  #include <rex/cvar.h>
  #include <rex/logging.h>
  #include <rex/platform.h>
-+#if REX_PLATFORM_PS5
 +#include <rex/ps5_diag.h>
-+#endif
 +#include <rex/platform.h>
  #include <rex/platform/env.h>
  
  #if REX_PLATFORM_WIN32
-@@ -232,6 +236,9 @@ void InitLogging(const LogConfig& config) {
+@@ -232,6 +234,9 @@ void InitLogging(const LogConfig& config) {
      sink->set_level(spdlog::level::trace);
      sink->set_pattern(config.file_pattern);
      g_file_sink = sink;
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +    rex::ps5diag::SetLogPath(resolved_path.c_str());  // [ps5 port] where a crash line goes
 +#endif
    }
@@ -2421,14 +2441,14 @@ index d639924c..7f325c0c 100644
  }  // namespace rex::thread
 diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
 new file mode 100644
-index 00000000..c19254b6
+index 00000000..f04fd203
 --- /dev/null
 +++ b/src/core/ps5_diag.cpp
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,409 @@
 +// [ps5 port] see rex/ps5_diag.h
 +#include <rex/ps5_diag.h>
 +
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +
 +#include <algorithm>
 +#include <cstdio>
@@ -2442,7 +2462,11 @@ index 00000000..c19254b6
 +
 +#include <fcntl.h>
 +#include <pthread.h>
++#if REX_PLATFORM_PS5
 +#include <pthread_np.h>
++#else
++#include <ucontext.h>
++#endif
 +#include <signal.h>
 +#include <unistd.h>
 +
@@ -2465,6 +2489,27 @@ index 00000000..c19254b6
 +uintptr_t Anchor() { return reinterpret_cast<uintptr_t>(&NowMs); }
 +
 +namespace {
++
++// The thread's id, as the system shows it.
++int ThreadId() {
++#if REX_PLATFORM_PS5
++  return pthread_getthreadid_np();
++#else
++  return int(gettid());
++#endif
++}
++
++// Where a thread was when the signal came: its rip and rsp.
++#if REX_PLATFORM_PS5
++// The PS5 kernel hands signal handlers the FreeBSD amd64 ucontext with 48
++// extra bytes in front: mcontext starts at +64 (exception_handler_posix.cpp),
++// rip in its slot 20 and rsp in slot 23.
++inline uintptr_t ContextRip(void* uc) { return reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(uc) + 64)[20]; }
++inline uintptr_t ContextRsp(void* uc) { return reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(uc) + 64)[23]; }
++#else
++inline uintptr_t ContextRip(void* uc) { return uintptr_t(static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_RIP]); }
++inline uintptr_t ContextRsp(void* uc) { return uintptr_t(static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_RSP]); }
++#endif
 +
 +struct ThreadEntry {
 +  std::atomic<bool> used{false};
@@ -2497,18 +2542,14 @@ index 00000000..c19254b6
 +  return v > (anchor > kNear ? anchor - kNear : 0x10000) && v < anchor + kNear;
 +}
 +
-+// The PS5 kernel hands signal handlers the FreeBSD amd64 ucontext with 48
-+// extra bytes in front: mcontext starts at +64 (exception_handler_posix.cpp),
-+// rip in its slot 20 and rsp in slot 23.
 +void SampleHandler(int, siginfo_t*, void* uc) {
 +  ThreadEntry* e = my_entry;
 +  if (!e) return;
-+  auto* gregs = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(uc) + 64);
 +  if (e->want_prof.exchange(false, std::memory_order_acq_rel)) {
 +    // The profiler's sample: where the thread is and, when that is outside the
 +    // program (the C library, the kernel's, the system's), the nearest return
 +    // address into the program on its stack; and the processor time it has used.
-+    const uintptr_t rip = gregs[20], rsp = gregs[23];
++    const uintptr_t rip = ContextRip(uc), rsp = ContextRsp(uc);
 +    uintptr_t caller = 0;
 +    if (!InProgram(rip)) {
 +      uintptr_t end = rsp + 4096;
@@ -2530,8 +2571,8 @@ index 00000000..c19254b6
 +    e->prof_seq.fetch_add(1, std::memory_order_release);
 +  }
 +  if (!e->want_stack.exchange(false, std::memory_order_acq_rel)) return;
-+  e->rip = gregs[20];
-+  e->rsp = gregs[23];
++  e->rip = ContextRip(uc);
++  e->rsp = ContextRsp(uc);
 +  uintptr_t end = e->rsp + 64 * 1024;
 +  if (e->stack_top && e->stack_top < end) end = e->stack_top;
 +  int n = 0;
@@ -2592,7 +2633,7 @@ index 00000000..c19254b6
 +  if (i >= kThreads) return;
 +  ThreadEntry& e = threads[i];
 +  e.pthread = pthread_self();
-+  e.tid = pthread_getthreadid_np();
++  e.tid = ThreadId();
 +  int marker = 0;
 +  e.stack_top = reinterpret_cast<uintptr_t>(&marker) + 256;  // (a little above: the caller's frame)
 +  std::strncpy(e.what, what ? what : "", sizeof(e.what) - 1);
@@ -2773,7 +2814,7 @@ index 00000000..c19254b6
 +  const uintptr_t anchor = Anchor();
 +  static RawLine line;
 +  line.Add("\n[ps5 crash] thread ");
-+  line.Dec(uint64_t(my_entry ? my_entry->tid : pthread_getthreadid_np()));
++  line.Dec(uint64_t(my_entry ? my_entry->tid : ThreadId()));
 +  line.Add(" (");
 +  line.Add(my_entry ? my_entry->what : "unregistered");
 +  line.Add(") faulted at ");
@@ -2812,7 +2853,7 @@ index 00000000..c19254b6
 +
 +}  // namespace rex::ps5diag
 +
-+#endif  // REX_PLATFORM_PS5
++#endif  // REX_PS5_PROGRAM
 diff --git a/src/core/ps5_libc_extras.c b/src/core/ps5_libc_extras.c
 new file mode 100644
 index 00000000..87f97fed
@@ -2999,7 +3040,7 @@ index fd06c662..140a0042 100644
    return value;
  }
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index bed1e59c..90d66b44 100644
+index bed1e59c..43ba8c8c 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -66,7 +66,9 @@ uint32_t NxKernelPriority() {
@@ -3017,10 +3058,10 @@ index bed1e59c..90d66b44 100644
  #endif
  
 -#if REX_PLATFORM_LINUX
++#include <rex/ps5_diag.h>
 +#if REX_PLATFORM_PS5
 +// [ps5 port] FreeBSD naming of the thread helpers the PS5 exports.
 +#include <pthread_np.h>
-+#include <rex/ps5_diag.h>
 +static inline pid_t rex_ps5_system_tid() { return pid_t(pthread_getthreadid_np()); }
 +
 +// [ps5 port] Thread stacks in direct memory. libkernel takes a thread's stack
@@ -3290,7 +3331,7 @@ index bed1e59c..90d66b44 100644
        cond_.notify_all();
      }
      if (is_current_thread) {
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +      rex::ps5diag::UnregisterThread();
 +#endif
        pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -3323,28 +3364,30 @@ index bed1e59c..90d66b44 100644
  #endif
    bool signaled_;
    int exit_code_;
-@@ -1481,6 +1613,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1481,6 +1613,12 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
  
    current_thread_ = thread;
    current_thread_condition_ = &thread->handle_;
 +#if REX_PLATFORM_PS5
 +  thread->handle_.tid_.store(rex_ps5_system_tid(), std::memory_order_release);
++#endif
++#if REX_PS5_PROGRAM
 +  rex::ps5diag::RegisterThread("rex");
 +#endif
  #if REX_PLATFORM_NX
    thread->handle_.nn_thread_ = nn::os::GetCurrentThread();
    if (NxPrioEnabled()) {
-@@ -1515,6 +1651,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1515,6 +1653,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
    }
  
    start_routine();
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +  rex::ps5diag::UnregisterThread();
 +#endif
  
    {
      std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-@@ -1588,6 +1727,8 @@ void Thread::Exit(int exit_code) {
+@@ -1588,6 +1729,8 @@ void Thread::Exit(int exit_code) {
  void set_current_thread_name(const std::string_view name) {
  #if defined(__APPLE__)
    pthread_setname_np(std::string(name).c_str());
@@ -3565,7 +3608,7 @@ index c5516b5d..1c792b0d 100644
    // N2: the NX disc image is a lazily-read region; fetch the bytes before touching them.
    if (!entry_->mmap()->Prefetch(real_offset, real_length)) {
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
-index 0d8f8af0..e75b77f4 100644
+index 0d8f8af0..295c4620 100644
 --- a/src/graphics/CMakeLists.txt
 +++ b/src/graphics/CMakeLists.txt
 @@ -96,7 +96,14 @@ if(REXGLUE_USE_D3D12)
@@ -3575,8 +3618,8 @@ index 0d8f8af0..e75b77f4 100644
 -add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 +# [ps5 port] The PS5 has no shared libraries of our own: the Xenos backend is
 +# a static library linked into the program, and gpu_plugin_loader.cpp calls
-+# its rex_gpu_create directly.
-+if(PS5)
++# its rex_gpu_create directly (and so in the PS5 program's Linux test build).
++if(PS5 OR REXGLUE_PS5_LINUX_TEST)
 +    add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
 +else()
 +    add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
@@ -3647,7 +3690,7 @@ index 2266c728..15eb5729 100644
            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
          }
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0b..4423ae36 100644
+index 8f2fcb0b..49295874 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -10,6 +10,7 @@
@@ -3663,7 +3706,7 @@ index 8f2fcb0b..4423ae36 100644
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
  
 +// [ps5 port] rex/graphics/graphics_system.h, "Adaptive vsync".
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +#define REX_VSYNC_ADAPTIVE_DEFAULT true
 +#else
 +#define REX_VSYNC_ADAPTIVE_DEFAULT false
@@ -3822,7 +3865,7 @@ index 76f5600c..989fc100 100644
    assert_true(IsDrawResolutionScaled());
    if (invalidated_by_gpu) {
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index ec0df7c8..43f00e7b 100644
+index ec0df7c8..25ca96ba 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -15,10 +15,27 @@
@@ -3841,7 +3884,7 @@ index ec0df7c8..43f00e7b 100644
 +#include <xxhash.h>
 +
 +// [ps5 port] rex/graphics/shared_memory.h, "Volatile pages".
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +#define REX_VOLATILE_PAGES_DEFAULT true
 +#else
 +#define REX_VOLATILE_PAGES_DEFAULT false
@@ -4178,7 +4221,7 @@ index ec0df7c8..43f00e7b 100644
      uint64_t invalidate_bits = UINT64_MAX;
      if (i == block_first) {
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 6207c1c6..47ad65d5 100644
+index 6207c1c6..2d427813 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -4279,7 +4322,7 @@ index 6207c1c6..47ad65d5 100644
 +  gpu_timestamp_slot_submission_.fill(0);
 +  gpu_timestamp_last_end_ = 0;
 +  gpu_busy_ns_unreported_ = 0.0;
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
 +  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
 +  const auto& ifn = vulkan_device->vulkan_instance()->functions();
@@ -4458,7 +4501,7 @@ index 6207c1c6..47ad65d5 100644
 +}
 +
 +void VulkanCommandProcessor::ReportGpuPhases() {
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +  const uint64_t now_ms = rex::ps5diag::NowMs();
 +  if (!gpu_phase_report_ms_) {
 +    gpu_phase_report_ms_ = now_ms;
@@ -4714,6 +4757,32 @@ index b49e033b..51215f22 100644
        default:
          assert_unhandled_case(header.command);
          break;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 77e61060..abc39793 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -214,7 +214,11 @@ void P4AfterPipeline(const ui::vulkan::VulkanDevice* vd, uint64_t vs,
+ }  // namespace
+ 
+ // P7 step 2: NX-app hook after each pipeline creation (weak; null when the app does not define it).
++// [ps5 port] Not in the PS5 program: its packager wants every symbol left
++// undefined, weak or not, to be one the console exports.
++#if !REX_PS5_PROGRAM
+ extern "C" __attribute__((weak)) void p7_nx_after_pipeline_create();
++#endif
+ 
+ namespace {
+ struct P7Warm {
+@@ -230,7 +234,9 @@ P7Warm& p7_warm() {
+   return w;
+ }
+ void P7Warmup(const ui::vulkan::VulkanDevice* vd, VkPipeline pipeline) {
++#if !REX_PS5_PROGRAM
+   if (p7_nx_after_pipeline_create) p7_nx_after_pipeline_create();  // P7 step 2
++#endif
+   if (REXCVAR_GET(p7_nx_pipeline_warmup) != 1) return;
+   const ui::vulkan::VulkanDevice::Functions& dfn = vd->functions();
+   const VkDevice device = vd->device();
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
 index 0298f062..7f106fde 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
@@ -5204,7 +5273,7 @@ index 00000000..1c8c85b9
 +
 +}  // namespace rex::input::ps5
 diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
-index 1fda0536..958dd7c3 100644
+index 1fda0536..defbab93 100644
 --- a/src/kernel/xam/xam_info.cpp
 +++ b/src/kernel/xam/xam_info.cpp
 @@ -12,6 +12,10 @@
@@ -5244,8 +5313,8 @@ index 1fda0536..958dd7c3 100644
  REX_EXPORT(__imp__XamFree, rex::kernel::xam::XamFree_entry)
  REX_EXPORT(__imp__XamQueryLiveHiveW, rex::kernel::xam::XamQueryLiveHiveW_entry)
  REX_EXPORT(__imp__XamLoaderGetDvdTrayState, rex::kernel::xam::XamLoaderGetDvdTrayState_entry)
-+#if REX_PLATFORM_PS5
-+// [ps5 port] One static program on the PS5: a title that brings its own
++#if REX_PS5_PROGRAM
++// [ps5 port] One static program on the PS5 (and its Linux test build): a title that brings its own
 +// XamSwapDisc (Dead Space 2's automatic disc swap, a strong symbol in the app)
 +// replaces this stub instead of colliding with it at link time. On the PC the
 +// runtime is a DLL and the two never meet.
@@ -5253,16 +5322,17 @@ index 1fda0536..958dd7c3 100644
 +#endif
  REX_EXPORT(__imp__XamSwapDisc, rex::kernel::xam::XamSwapDisc_entry)
 diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
-index fc46d869..1251c2e3 100644
+index fc46d869..a0dc8dd0 100644
 --- a/src/system/CMakeLists.txt
 +++ b/src/system/CMakeLists.txt
-@@ -48,7 +48,12 @@ set(REXSYSTEM_SOURCES
+@@ -48,7 +48,13 @@ set(REXSYSTEM_SOURCES
      xex_module.cpp
  )
  
 -add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
-+# [ps5 port] one static app on the PS5 (no shared libraries of our own).
-+if(PS5)
++# [ps5 port] one static app on the PS5 (no shared libraries of our own),
++# and in its Linux test build.
++if(PS5 OR REXGLUE_PS5_LINUX_TEST)
 +    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
 +else()
 +    add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
@@ -5271,14 +5341,14 @@ index fc46d869..1251c2e3 100644
  add_library(rex::system ALIAS rexruntime)
  add_library(rex::kernel ALIAS rexruntime)
 diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
-index 754fa138..b84962eb 100644
+index 754fa138..5a8318e5 100644
 --- a/src/system/gpu_plugin_loader.cpp
 +++ b/src/system/gpu_plugin_loader.cpp
 @@ -54,7 +54,31 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
  
  }  // namespace
  
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +}  // namespace rex::system
 +// [ps5 port] No shared libraries of our own on the PS5: the Xenos backend is
 +// linked into the program (graphics/plugin_main.cpp) and created directly.
@@ -5288,7 +5358,7 @@ index 754fa138..b84962eb 100644
 +#endif
 +
  std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +  {
 +    std::string backend_str(backend);
 +    GpuCreateInfo info{};
@@ -6023,14 +6093,14 @@ index dc0b4c2e..45e6d3e4 100644
    if (!requested_driver.empty()) {
      SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 77bb1dc2..1774e0d9 100644
+index 77bb1dc2..e7966c52 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
 @@ -67,6 +67,12 @@ int RunWindowedApp(int argc, char** argv) {
      app->SetParsedArguments(std::move(parsed));
  
      result = app->OnInitialize() ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
-+#if REX_PLATFORM_PS5
++#if REX_PS5_PROGRAM
 +    // [ps5 port] Skip the teardown: guest threads can't be stopped reliably,
 +    // and the C runtime's exit handlers then end in a crash report.
 +    rex::FlushLogging();
@@ -6039,14 +6109,15 @@ index 77bb1dc2..1774e0d9 100644
  
      app->InvokeOnDestroy();
    }
-@@ -124,6 +130,149 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+@@ -124,6 +130,160 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
    return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
  }
  
-+#elif REX_PLATFORM_PS5
++#elif REX_PS5_PROGRAM
 +
-+// [ps5 port] The PS5 entry point (after the GTA IV PS5 port's): work in the
-+// app's folder, say on screen when something stops the game, and keep a
++// [ps5 port] The PS5 entry point (after the GTA IV PS5 port's), also the
++// one of its Linux test build: work in the app's folder (on the PS5), say on
++// screen when something stops the game, and keep a
 +// monitor thread that logs progress counters, so a black screen's log shows
 +// which stage stopped moving.
 +
@@ -6065,7 +6136,9 @@ index 77bb1dc2..1774e0d9 100644
 +#include <rex/chrono/clock.h>
 +#include <rex/ps5_diag.h>
 +
++#if REX_PLATFORM_PS5
 +extern "C" int sceKernelSendNotificationRequest(int, void*, size_t, int);
++#endif
 +
 +REXCVAR_DEFINE_BOOL(ps5_diag_monitor, true, "PS5",
 +                    "Log progress counters every 10 s and, when the game stops drawing, where every "
@@ -6074,13 +6147,19 @@ index 77bb1dc2..1774e0d9 100644
 +namespace {
 +
 +void Ps5Notify(const char* text) {
++#if !REX_PLATFORM_PS5
++  std::fprintf(stderr, "[notification] %s\n", text);  // (the Linux test build)
++  return;
++#endif
 +  struct {
 +    char unused[45];
 +    char message[3075];
 +  } request;
 +  std::memset(&request, 0, sizeof(request));
 +  std::strncpy(request.message, text, sizeof(request.message) - 1);
++#if REX_PLATFORM_PS5
 +  sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
++#endif
 +}
 +
 +// An uncaught C++ exception ends in abort() with its message on stderr, which
@@ -6149,7 +6228,9 @@ index 77bb1dc2..1774e0d9 100644
 +}  // namespace
 +
 +int main(int argc, char* argv[]) {
++#if REX_PLATFORM_PS5
 +  chdir("/app0");
++#endif
 +  rex::ps5diag::RegisterThread("main");
 +  // A thread that crashed (it would retry its faulting instruction forever,
 +  // behind a frozen picture): say so and close the game. It runs in the fault
@@ -6226,6 +6307,12 @@ index f102b56a..dd2a6d40 100644
  add_subdirectory(sdl3)
  
  #=============================================================================
+diff --git a/thirdparty/FFmpeg b/thirdparty/FFmpeg
+--- a/thirdparty/FFmpeg
++++ b/thirdparty/FFmpeg
+@@ -1 +1 @@
+-Subproject commit 0604b464c7cb4ebc94940cf1f324a3b26b87717c
++Subproject commit 0604b464c7cb4ebc94940cf1f324a3b26b87717c-dirty
 diff --git a/thirdparty/crypto/sha256.cpp b/thirdparty/crypto/sha256.cpp
 index e96b4da1..df468e8a 100644
 --- a/thirdparty/crypto/sha256.cpp

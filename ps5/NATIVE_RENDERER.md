@@ -38,10 +38,53 @@ takes over two of the game's functions. Render states are inline code that
 writes the device structure in guest memory, so a draw reads the state from
 there.
 
+## Where the transfers come from
+
+The game's renderer is EA's `llrender` (`src_tu2/EARS/ears_rt_llrender/src/xenon/`),
+the only code that calls Direct3D, with its real names from the PDB. The main
+picture is drawn at 1x, without MSAA. `Displ_StartLowRes_XenonSpecific` and
+`Displ_EndLowRes_XenonSpecific` switch the colour target (render target 0) and the
+depth target (4) to 4x MSAA over the same EDRAM and back: half the width and
+height, each 4x pixel's samples being a 2x2 block of the 1x pixels. On the Xbox
+360 that is a quarter of the pixel work for free; here each switch is a copy of
+the whole target, both ways. Their callers:
+
+- `EARS::Framework::DeferredLitHiStencilCullingClass` (`StartCullingType` and the
+  rest): for each kind of light in the deferred lighting, stencil-only full-screen
+  passes (`DS_vSetStencilCull`, colour writes off) mark the pixels the lights can
+  reach. 21 to 25 sections a frame in a lit room: this is the depth buffer's 1x/4x
+  switching the console's profile showed.
+- `SceneManagerInternal::RenderDeferredBuffer_CreateShadowAttenuation`.
+- `EARS::Alchemy::LowResolution` (low resolution effects), with
+  `Displ_ResolveInHalf_XenonSpecific`.
+
+`ps5/src/ds2_ps5_lowres.cpp` counts the sections per caller in the log
+(`ps5 lowres:`), and `ps5_lowres_culling = "full"` keeps the culling at 1x: the same
+pixels are marked, with no copies. On the Linux test build (below), in the
+save-station room of a save (720p, Radeon 760M), 30 s each:
+
+| | `game` (as the Xbox 360) | `full` |
+|---|---|---|
+| frames a second | 34.4 (35.2 on a second run) | 58.7 |
+| EDRAM transfers | 17.6 ms, 58 a frame | 4.1 ms, 8 a frame |
+| the game's draws | 6.7 ms | 6.3 ms |
+
+The pictures differ from each other no more than two runs of `game` do (on the
+animated character and the fog). Still to see: other scenes, and a console at 4K.
+
+## Testing on a PC
+
+`ps5/tools/linux_test.sh` (ps5/BUILD.md, "On Linux") builds the PS5 program for
+Linux, with the same app, SDK, log and profiler. `ps5_input_script` plays the menus
+by itself (`"6:start 10:start ... 38:start 42:a 50:a"` gets from a cold start into
+the last save in about 55 s), and `ps5_capture` saves the picture every few
+seconds, so two settings can be run the same way and their pictures and profiles
+compared.
+
 ## Steps
 
-Every step is tested on a console: none of this can run where it is written.
-Each adds what the log needs to say what went wrong, and the emulated renderer
+Every step is tested on the Linux test build first and then on a console. Each
+adds what the log needs to say what went wrong, and the emulated renderer
 stays the default until the native one is better everywhere.
 
 0. **Record** (`ps5/src/ds2_ps5_d3d_trace.cpp`, `ps5_d3d_trace = 1`): the game's

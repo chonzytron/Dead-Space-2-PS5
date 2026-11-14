@@ -15,5 +15,10 @@
 // for Windows (64 KB units) and Apple Silicon (16 KB pages); the PS5 has 16 KB
 // pages and 64 KB direct memory units and needs it too. The two must agree, or
 // the game and the kernel calls it makes read and write 4 KB apart.
+// (Linux has 4 KB pages and maps it where it is: the Linux test build keeps
+// the generated header's 0.)
+#include <rex/platform.h>
+#if REX_PLATFORM_PS5
 #undef REX_PHYS_HOST_OFFSET
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+#endif

@@ -6,11 +6,22 @@
 # and a GPU plugin DLL. A PS5 app has no shared libraries of its own, so the
 # SDK source (pinned upstream + sdk/rexglue_ds2.patch + sdk/rexglue_ps5.patch,
 # put in place by ps5/tools/fetch_sdk.sh) is built here, in this tree.
+#
+# DS2_PS5_LINUX=ON builds the same program for Linux instead, to test it on a
+# PC before it goes on a console (ps5/BUILD.md, "On Linux"): the same app and
+# SDK, the runtime and GPU backend linked in as on the PS5, the PS5's
+# diagnostics and profiler; SDL's window, pad and sound where the PS5 has its
+# own.
 cmake_minimum_required(VERSION 3.25)
 project(ds2-ps5 LANGUAGES C CXX)
 
-if(NOT PS5)
-    message(FATAL_ERROR "Configure with -DCMAKE_TOOLCHAIN_FILE=ps5/cmake/ps5-toolchain.cmake (ps5/BUILD.md)")
+option(DS2_PS5_LINUX "Build the PS5 program for Linux, to test it on a PC" OFF)
+if(NOT PS5 AND NOT DS2_PS5_LINUX)
+    message(FATAL_ERROR "Configure with -DCMAKE_TOOLCHAIN_FILE=ps5/cmake/ps5-toolchain.cmake (ps5/BUILD.md), "
+                        "or with -DDS2_PS5_LINUX=ON for the Linux test build")
+endif()
+if(DS2_PS5_LINUX AND PS5)
+    message(FATAL_ERROR "DS2_PS5_LINUX is the Linux build: configure it without the PS5 toolchain")
 endif()
 
 set(CMAKE_CXX_STANDARD 23)
@@ -47,6 +58,7 @@ set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
 set(REXGLUE_ENABLE_PERF_COUNTERS OFF CACHE BOOL "" FORCE)
 set(REXGLUE_ENABLE_FIDELITYFX OFF CACHE BOOL "" FORCE)
 set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(REXGLUE_PS5_LINUX_TEST ${DS2_PS5_LINUX} CACHE BOOL "" FORCE)
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 
 # --- The recompiled game ----------------------------------------------------
@@ -76,7 +88,17 @@ add_executable(ds2
     "${DS2_PS5_DIR}/src/ds2_ps5_disc_swap.cpp"
     "${DS2_PS5_DIR}/src/ds2_ps5_framerate.cpp"
     "${DS2_PS5_DIR}/src/ds2_ps5_d3d_trace.cpp"
+    "${DS2_PS5_DIR}/src/ds2_ps5_lowres.cpp"
+    "${DS2_PS5_DIR}/src/ds2_ps5_script.cpp"
 )
+if(DS2_PS5_LINUX)
+    # What the console's system libraries answer, for Linux; and the SDK's
+    # switch for its PS5 program parts (rex/platform.h, REX_PS5_PROGRAM),
+    # which the SDK sets for its own files only.
+    target_sources(ds2 PRIVATE "${DS2_PS5_DIR}/src/ds2_ps5_linux.cpp")
+    target_compile_definitions(ds2 PRIVATE REX_PS5_LINUX_TEST=1)
+    target_compile_definitions(ds2_recomp PRIVATE REX_PS5_LINUX_TEST=1)
+endif()
 target_include_directories(ds2 PRIVATE
     "${DS2_GEN}" "${DS2_SRC}/app" "${DS2_PS5_DIR}/src"
     # crypto/sha256.h: checking the player's files against the ones the code was
@@ -85,19 +107,25 @@ target_include_directories(ds2 PRIVATE
     "${REXSDK_DIR}/thirdparty/imgui"
 )
 target_compile_definitions(ds2 PRIVATE DS2_TARGET_TU2=1 DS2_PS5_VERSION="${DS2_PS5_VERSION}")
-target_compile_options(ds2 PRIVATE "SHELL:-include ${REXSDK_DIR}/include/rex/ps5_compat.h")
-target_compile_options(ds2_recomp PRIVATE "SHELL:-include ${REXSDK_DIR}/include/rex/ps5_compat.h")
+if(PS5)
+    target_compile_options(ds2 PRIVATE "SHELL:-include ${REXSDK_DIR}/include/rex/ps5_compat.h")
+    target_compile_options(ds2_recomp PRIVATE "SHELL:-include ${REXSDK_DIR}/include/rex/ps5_compat.h")
+endif()
 # The runtime and the Xenos backend, both static here (the backend is created
 # directly by the SDK's gpu_plugin_loader.cpp on the PS5).
 target_link_libraries(ds2 PRIVATE
     ds2_recomp
     rex::runtime
     rexgpu-xenos
-    SceUserService ScePad SceAudioOut SceSystemService SceVideoOut
 )
+if(PS5)
+    target_link_libraries(ds2 PRIVATE SceUserService ScePad SceAudioOut SceSystemService SceVideoOut)
+endif()
 rexglue_apply_target_settings(ds2)
 # The SDK's app template and entry point (rex_app.cpp, windowed_app_main_sdl.cpp).
 rexglue_configure_target(ds2)
-# CMake's own link is skipped: ps5/tools/ps5_package.sh links the program with
-# the PS5 Vulkan driver and start-up code and packages it.
-set_property(TARGET ds2 PROPERTY RULE_LAUNCH_LINK "${DS2_PS5_DIR}/tools/ps5_skip_link.sh")
+if(PS5)
+    # CMake's own link is skipped: ps5/tools/ps5_package.sh links the program with
+    # the PS5 Vulkan driver and start-up code and packages it.
+    set_property(TARGET ds2 PROPERTY RULE_LAUNCH_LINK "${DS2_PS5_DIR}/tools/ps5_skip_link.sh")
+endif()

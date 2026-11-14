@@ -34,6 +34,7 @@
 #include <fmt/format.h>
 
 #include "ds2_disc_swap.h"
+#include "ds2_ps5_capture.h"
 #include "ds2_ps5_install.h"
 
 // The game's language: the Xbox 360's, taken from the PS5's unless set here.
@@ -310,6 +311,9 @@ class Ds2Ps5App : public rex::ReXApp {
   void OnPreLaunchModule() override {
     // (here and not earlier: over the game, not over the screens before it)
     if (REXCVAR_GET(ps5_profile)) rex::ps5diag::StartProfiler(30);
+    if (runtime() && runtime()->graphics_system()) {
+      ds2ps5::PictureCapture::Start(runtime()->graphics_system()->presenter(), app_root() / "logs");
+    }
     if (REXCVAR_GET(ps5_show_fps) && imgui_drawer() && !fps_counter_) {
       fps_counter_ = std::make_unique<ds2ps5::FpsCounter>(imgui_drawer());
     }

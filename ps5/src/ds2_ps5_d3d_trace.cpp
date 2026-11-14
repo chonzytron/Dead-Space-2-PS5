@@ -41,6 +41,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ps5_diag.h>
+#include <rex/system/xmemory.h>
 
 REXCVAR_DEFINE_INT32(ps5_d3d_trace, 0, "PS5",
                      "Record the game's Direct3D calls: 0 off, 1 a summary every 30 s and a whole "
@@ -174,8 +175,8 @@ uint32_t GuestWord(const uint8_t* base, uint32_t address) {
   if (address < 0x10000 || address > 0xFFFFFFF0u) {
     return 0;
   }
-  // (the 0xE0000000 range is 4 KB into the memory it mirrors: ds2_ps5_pch.h)
-  const uint32_t host = address + (address >= 0xE0000000u ? 0x1000u : 0u);
+  // (on the PS5 the 0xE0000000 range is 4 KB into the memory it mirrors: ds2_ps5_pch.h)
+  const uint32_t host = address + rex::memory::detail::PhysicalHostOffset(address);
   uint32_t value;
   std::memcpy(&value, base + host, 4);
   return __builtin_bswap32(value);

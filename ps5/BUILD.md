@@ -101,6 +101,36 @@ game code, which map to the original functions through `src_tu2/symbols.tsv`):
 python3 ps5/tools/ps5_symbolize.py out/ps5/ps5-link/build/llvm-pie.elf ds2_001.log
 ```
 
+## On Linux
+
+The same program can be built for Linux, to try a change on a PC before it goes on a
+console: the same app (`ps5/src/`), the same patched SDK, the runtime and GPU backend
+linked in as on the PS5, the PS5's log lines, diagnostics and profiler, compiled for the
+PS5's processor (`-march=znver2`: any AMD Zen 2 or newer, or a recent Intel). Only what
+only the console has differs: the picture goes to a window, the controller and the sound
+through SDL. It runs on any Vulkan GPU; an AMD one uses RADV, the PS5's driver.
+
+```
+sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-libs-devel alsa-lib-devel \
+  systemd-devel dbus-devel pipewire-devel libdecor-devel libXScrnSaver-devel   # Fedora
+ps5/tools/linux_test.sh build
+ps5/tools/linux_test.sh run <folder with your game files> [--setting=value ...]
+```
+
+The first build takes a few minutes (`DS2_LINUX_JOBS` sets the parallel jobs; one per
+2.5 GB of memory by default). `run` takes a folder laid out as the PS5 app's `install/`
+(your disc images and Title Update #2, and Severed if you have it); it is only read.
+The program finds everything next to itself, as on the PS5, so it runs from a folder of
+its own, `~/.local/share/ds2-ps5-linux` (`DS2_LINUX_RUN`): `ds2.toml`, `logs/`, `game/`
+and `UserData/` are there, as in the app's folder on the console.
+
+For tests (in `ds2.toml`, on Linux and on the PS5):
+
+| Setting | |
+|---|---|
+| `ps5_capture = 10` | the game's picture every 10 s in `logs/capture_<n>.bmp` (at most 1280 wide), with its frame number in the log |
+| `ps5_input_script = "20:start 24:a 60:lsup/3000"` | buttons pressed by themselves at those seconds (held 150 ms, or as long as `/<ms>` says), on top of a real controller (`ps5/src/ds2_ps5_script.cpp` lists the buttons) |
+
 ## Where things are
 
 | | |
@@ -112,6 +142,9 @@ python3 ps5/tools/ps5_symbolize.py out/ps5/ps5-link/build/llvm-pie.elf ds2_001.l
 | `ps5/src/ds2_ps5_install.*` | finding and preparing the game from the player's files |
 | `ps5/src/ds2_ps5_framerate.cpp` | 60 FPS: the PC `framerate` mod's two hooks, as the `ps5_frame_rate` setting, and 30 in cutscenes (`ps5_cutscenes_30`) |
 | `ps5/src/ds2_ps5_d3d_trace.cpp` | the game's Direct3D calls recorded (`ps5_d3d_trace`), the first step of `ps5/NATIVE_RENDERER.md` |
+| `ps5/src/ds2_ps5_lowres.cpp` | the game's 4x MSAA "low resolution" sections counted, and the lighting's culling kept at 1x (`ps5_lowres_culling`) |
+| `ps5/src/ds2_ps5_capture.h`, `ds2_ps5_script.cpp` | for tests: pictures in the logs folder (`ps5_capture`), buttons pressed by themselves (`ps5_input_script`) |
+| `ps5/src/ds2_ps5_linux.cpp`, `ps5/tools/linux_test.sh` | the Linux test build |
 | `ps5/src/ds2_ps5_io.h` | unpacking past the PS5's file cache (`ps5/tests/ps5_io_test.cpp` runs it on Linux) |
 | `ps5/src/ds2_ps5_pch.h` | the recompiled code's precompiled header with the PS5's memory offset |
 | `ps5/tools/` | SDK fetch, link and packaging, log symbolizer |

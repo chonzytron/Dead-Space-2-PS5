@@ -61,11 +61,28 @@
 # needs a copy; "color" or "depth" makes only those of that kind.
 #ps5_edram_transfers = "all"
 
+# Experiment, for performance work: most of those copies come from the
+# lighting's stencil culling, which the game draws at 4x MSAA over the memory
+# of the 1x picture (a quarter of the work on an Xbox 360, two full-screen
+# copies here, about 25 times a frame). "full" draws it at 1x instead, with no
+# copies. If lights look wrong (missing, cut off, or lighting things they
+# shouldn't), set it back to "game".
+#ps5_lowres_culling = "game"
+
 # For the native renderer's work: 1 records the game's Direct3D calls. Every
 # 30 s a line in the log, every 60 s one whole frame call by call in the logs
 # folder (d3d_frame_<n>.txt), and each shader the game creates
 # (d3d_shaders.txt). A little slower while a frame is recorded.
 #ps5_d3d_trace = 0
+
+# For tests: the game's picture every this many seconds in the logs folder
+# (capture_<n>.bmp, at most 1280 wide), to send with a log. 0: never.
+#ps5_capture = 0
+
+# For tests: buttons pressed by themselves at those seconds, e.g. through the
+# menus into the last save: "6:start 10:start 14:start 18:start 22:start
+# 26:start 30:start 34:start 38:start 42:a 50:a". Leave it empty to play.
+#ps5_input_script = ""
 
 # For performance work only, when a log is being recorded to find out what
 # limits the frame rate: every 30 s the log gets, for each busy thread, how
