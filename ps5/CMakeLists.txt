@@ -74,6 +74,8 @@ add_executable(ds2
     "${DS2_PS5_DIR}/src/main.cpp"
     "${DS2_PS5_DIR}/src/ds2_ps5_install.cpp"
     "${DS2_PS5_DIR}/src/ds2_ps5_disc_swap.cpp"
+    "${DS2_PS5_DIR}/src/ds2_ps5_framerate.cpp"
+    "${DS2_PS5_DIR}/src/ds2_ps5_d3d_trace.cpp"
 )
 target_include_directories(ds2 PRIVATE
     "${DS2_GEN}" "${DS2_SRC}/app" "${DS2_PS5_DIR}/src"

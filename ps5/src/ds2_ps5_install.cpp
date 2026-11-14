@@ -5,6 +5,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -18,6 +19,8 @@
 
 #include <rex/filesystem/devices/disc_image_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/filesystem/devices/stfs_container_entry.h>
+#include <rex/filesystem/direct_io.h>
 #include <rex/filesystem/entry.h>
 #include <rex/filesystem/file.h>
 #include <rex/logging.h>
@@ -26,6 +29,8 @@
 
 // (by its folder: FreeBSD, and so the PS5 SDK, has a <sha256.h> of its own)
 #include "crypto/sha256.h"
+
+#include "ds2_ps5_io.h"
 
 namespace ds2ps5 {
 
@@ -161,70 +166,155 @@ void WalkFiles(rex::filesystem::Entry* entry, const fs::path& relative,
   }
 }
 
+// Where a file's bytes are in its package, when the package is one file and
+// the entry lists all of them (empty otherwise: the file is then read through
+// the SDK's own reader).
+std::vector<io::Extent> ExtentsOf(rex::filesystem::Entry* entry) {
+  const auto& blocks = static_cast<rex::filesystem::StfsContainerEntry*>(entry)->block_list();
+  std::vector<io::Extent> extents;
+  extents.reserve(blocks.size());
+  uint64_t bytes = 0;
+  for (const auto& block : blocks) {
+    if (block.file != 0) return {};
+    extents.push_back({block.offset, block.length});
+    bytes += block.length;
+  }
+  if (bytes != entry->size()) return {};
+  return extents;
+}
+
+// The slow way, for a file ExtentsOf can't describe: 4 MB at a time through
+// the SDK's reader and the file cache.
+bool CopyThroughCache(rex::filesystem::Entry* entry, const fs::path& out_path,
+                      const std::function<void(uint64_t)>& step) {
+  rex::filesystem::File* raw = nullptr;
+  if (entry->Open(rex::filesystem::FileAccess::kGenericRead, &raw) != X_STATUS_SUCCESS || !raw) return false;
+  std::unique_ptr<rex::filesystem::File, CloseFile> file(raw);
+  std::FILE* out = std::fopen(out_path.c_str(), "wb");
+  if (!out) return false;
+  std::vector<uint8_t> chunk(size_t(4) << 20);
+  size_t done = 0;
+  bool ok = true;
+  while (ok && done < entry->size()) {
+    size_t got = 0;
+    const size_t want = std::min(chunk.size(), entry->size() - done);
+    ok = file->ReadSync({chunk.data(), want}, done, &got) == X_STATUS_SUCCESS && got &&
+         std::fwrite(chunk.data(), 1, got, out) == got;
+    done += got;
+    if (ok) step(got);
+  }
+  return (std::fclose(out) == 0) && ok && done == entry->size();
+}
+
 // A DLC package unpacked where the runtime mounts DLC from:
 // <content root>/0000000000000000/<title id>/<content type>/<package file name>/
 // (the layout tools/extract_dlc.py writes on the PC).
+//
+// Read and written past the file cache (ds2_ps5_io.h). Each file is written
+// under a temporary name and renamed when it is whole, so a file that is there
+// with its size is done: an unpacking that was interrupted (the app closed, the
+// console turned off) goes on at the next start instead of starting again.
 bool InstallDlc(const fs::path& package, uint32_t content_type, const fs::path& content_root,
-                std::vector<std::string>& notes) {
+                std::vector<std::string>& notes, Progress* progress) {
   const fs::path destination = content_root / "0000000000000000" / fmt::format("{:08X}", kTitleId) /
                                fmt::format("{:08X}", content_type) / package.filename();
   const fs::path marker = destination / ".ds2ps5_installed";
   std::error_code ec;
   if (fs::exists(marker, ec)) return true;
+  const std::string name = package.filename().string();
+  if (progress) progress->SetStep("Reading the add-on content package");
   rex::filesystem::StfsContainerDevice device("\\Device\\Ds2Ps5Dlc", package);
   if (!device.Initialize()) {
-    notes.push_back("DLC " + package.filename().string() + ": the package can't be read");
+    notes.push_back("DLC " + name + ": the package can't be read");
     return false;
   }
   rex::filesystem::Entry* root = device.ResolvePath("");
   if (!root) return false;
   std::vector<std::pair<rex::filesystem::Entry*, fs::path>> files;
   WalkFiles(root, {}, files);
-  uint64_t bytes = 0;
-  std::vector<uint8_t> chunk(size_t(4) << 20);
+  uint64_t total = 0;
+  for (const auto& [entry, relative] : files) total += entry->size();
+  if (progress) {
+    progress->done_bytes = 0;
+    progress->total_bytes = total;
+    progress->SetStep("Unpacking the add-on content");
+  }
+  REXLOG_INFO("ds2 files: DLC {}: unpacking {} files, {} MB, to {}", name, files.size(), total >> 20,
+              destination.string());
+  rex::FlushLogging();
+
+  if (progress && progress->announce) {
+    progress->announce(fmt::format("Dead Space 2: unpacking the add-on content ({} MB). This takes a few "
+                                   "minutes, the first time only.",
+                                   total >> 20));
+  }
+
+  rex::filesystem::direct::Reader reader;
+  const bool have_reader = reader.Open(package.c_str());
+  io::ChunkBuffer buffer;
+  const auto started = std::chrono::steady_clock::now();
+  auto logged = started;
+  uint64_t copied = 0, kept = 0, unpacked = 0;
+  // After each chunk: the screen's count, and a line in the log every 10 s.
+  const auto step = [&](uint64_t bytes) {
+    if (progress) progress->done_bytes += bytes;
+    unpacked += bytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - logged < std::chrono::seconds(10)) return;
+    logged = now;
+    const double seconds = std::chrono::duration<double>(now - started).count();
+    REXLOG_INFO("ds2 files: DLC {}: {} of {} MB after {:.0f} s ({:.1f} MB/s{}), screen drawn {} times", name,
+                (kept + unpacked) >> 20, total >> 20, seconds, double(unpacked >> 10) / 1024.0 / seconds,
+                reader.direct() ? ", past the file cache" : "", progress ? progress->draws.load() : 0);
+    rex::FlushLogging();
+  };
   for (const auto& [entry, relative] : files) {
     const fs::path out_path = destination / relative;
+    const uint64_t size = entry->size();
+    if (fs::is_regular_file(out_path, ec) && fs::file_size(out_path, ec) == size && !ec) {
+      kept += size;  // (whole, from a start that was interrupted)
+      if (progress) progress->done_bytes += size;
+      continue;
+    }
     fs::create_directories(out_path.parent_path(), ec);
-    rex::filesystem::File* raw = nullptr;
-    if (entry->Open(rex::filesystem::FileAccess::kGenericRead, &raw) != X_STATUS_SUCCESS || !raw) {
-      notes.push_back("DLC " + package.filename().string() + ": can't open " + relative.string());
-      return false;
-    }
-    std::unique_ptr<rex::filesystem::File, CloseFile> file(raw);
-    std::FILE* out = std::fopen(out_path.c_str(), "wb");
-    if (!out) {
-      notes.push_back("DLC: can't write " + out_path.string());
-      return false;
-    }
-    size_t done = 0;
-    bool ok = true;
-    while (ok && done < entry->size()) {
-      size_t got = 0;
-      const size_t want = std::min(chunk.size(), entry->size() - done);
-      ok = file->ReadSync({chunk.data(), want}, done, &got) == X_STATUS_SUCCESS && got &&
-           std::fwrite(chunk.data(), 1, got, out) == got;
-      done += got;
-    }
-    ok = (std::fclose(out) == 0) && ok && done == entry->size();
+    const fs::path temporary = out_path.string() + ".part";
+    const std::vector<io::Extent> extents = have_reader ? ExtentsOf(entry) : std::vector<io::Extent>();
+    const uint64_t before = progress ? progress->done_bytes.load() : 0, unpacked_before = unpacked;
+    bool ok = (!extents.empty() || size == 0) && have_reader &&
+              io::CopyExtents(reader, extents, temporary.c_str(), rex::filesystem::direct::kEnabled, buffer, step);
     if (!ok) {
-      notes.push_back("DLC " + package.filename().string() + ": " + relative.string() + " didn't copy whole");
+      if (progress) progress->done_bytes = before;
+      unpacked = unpacked_before;
+      ok = CopyThroughCache(entry, temporary, step);
+    }
+    if (ok) {
+      fs::rename(temporary, out_path, ec);
+      ok = !ec;
+    }
+    if (!ok) {
+      fs::remove(temporary, ec);
+      notes.push_back("DLC " + name + ": " + relative.string() + " didn't copy whole (is the drive full?)");
       return false;
     }
-    bytes += done;
+    copied += size;
   }
   if (std::FILE* f = std::fopen(marker.c_str(), "w")) {
-    std::fprintf(f, "%zu files, %llu bytes\n", files.size(), static_cast<unsigned long long>(bytes));
+    std::fprintf(f, "%zu files, %llu bytes\n", files.size(), static_cast<unsigned long long>(total));
     std::fclose(f);
   }
-  notes.push_back(fmt::format("DLC {} installed ({} files, {} MB)", package.filename().string(), files.size(),
-                              bytes >> 20));
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  notes.push_back(fmt::format("DLC {} installed ({} files, {} MB: {} MB unpacked in {:.0f} s{}, {} MB from an "
+                              "earlier start)",
+                              name, files.size(), total >> 20, copied >> 20, seconds,
+                              reader.direct() ? ", past the file cache" : "", kept >> 20));
   return true;
 }
 
 }  // namespace
 
-GameFiles PrepareGameFiles(const fs::path& app_root, const fs::path& content_root) {
+GameFiles PrepareGameFiles(const fs::path& app_root, const fs::path& content_root, Progress* progress) {
   GameFiles result;
+  if (progress) progress->SetStep("Looking for your game files");
   std::error_code ec;
   const fs::path install = app_root / "install";
   fs::create_directories(install, ec);
@@ -254,6 +344,7 @@ GameFiles PrepareGameFiles(const fs::path& app_root, const fs::path& content_roo
     const std::string extension = Lower(path.extension().string());
     const std::string name = Lower(path.filename().string());
     if (extension == ".iso") {
+      if (progress) progress->SetStep("Checking " + path.filename().string());
       rex::filesystem::DiscImageDevice disc("\\Device\\Ds2Ps5Inspect", path);
       if (!disc.Initialize()) {
         result.notes.push_back(path.filename().string() + ": not an Xbox 360 disc image this can read");
@@ -293,6 +384,7 @@ GameFiles PrepareGameFiles(const fs::path& app_root, const fs::path& content_roo
       if (!header || header->metadata.execution_info.title_id != kTitleId) continue;
       const uint32_t type = uint32_t(rex::system::XContentType(header->metadata.content_type));
       if (type == uint32_t(rex::system::XContentType::kInstaller)) {
+        if (progress) progress->SetStep("Reading the title update " + path.filename().string());
         rex::filesystem::StfsContainerDevice update("\\Device\\Ds2Ps5Update", path);
         if (!update.Initialize()) {
           result.notes.push_back(path.filename().string() + ": the title update can't be read");
@@ -340,7 +432,12 @@ GameFiles PrepareGameFiles(const fs::path& app_root, const fs::path& content_roo
   }
 
   for (size_t i = 0; i < dlc_packages.size(); ++i) {
-    InstallDlc(dlc_packages[i], dlc_types[i], content_root, result.notes);
+    InstallDlc(dlc_packages[i], dlc_types[i], content_root, result.notes, progress);
+  }
+  if (progress) {
+    progress->done_bytes = 0;
+    progress->total_bytes = 0;
+    progress->SetStep("Starting the game");
   }
 
   if (!result.boot_disc()) {

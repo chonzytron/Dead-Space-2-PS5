@@ -344,6 +344,67 @@ index 00000000..87e2fd2e
 +}  // namespace rex::filesystem::direct
 +
 +#endif  // !_WIN32
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056e..9fab334f 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -14,6 +14,8 @@
+ #include "rex/system/function_dispatcher.h"
+ 
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -77,6 +79,26 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+ 
++  // [ps5 port] Adaptive vsync (the vsync_adaptive setting).
++  //
++  // The game's D3D holds each frame at a WAIT_REG_MEM until its vblank
++  // interrupt lets it go, so a frame that isn't ready for a vblank waits a
++  // whole one more: 17 ms of work is shown after 33, and 60 frames a second
++  // become 30. The vblank here is a timer of ours, not the TV's (the picture
++  // reaches the TV through the presenter, at the TV's own pace), so it can
++  // come when the late frame is ready: when the command processor starts
++  // waiting and a vblank has gone by since its last wait ended, the vblank
++  // thread gives one at once and counts its interval on from there. A frame
++  // that is early still waits for its vblank: never more than one frame per
++  // interval.
++  //
++  // The command processor says when it waits:
++  uint64_t vblank_serial() const { return vblank_serial_.load(std::memory_order_acquire); }
++  void BeginSwapWait();
++  void EndSwapWait();
++  // Until a vblank after `serial_seen` has been given, or for `timeout`.
++  void WaitForVblankAfter(uint64_t serial_seen, std::chrono::milliseconds timeout);
++
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
+@@ -120,6 +142,20 @@ class GraphicsSystem : public system::IGraphicsSystem {
+ 
+   std::atomic<bool> vsync_worker_running_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
++  // [ps5 port] adaptive vsync
++  std::mutex vsync_mutex_;
++  std::condition_variable vsync_wake_, vblank_given_;
++  bool vsync_wake_requested_ = false;                      // (under vsync_mutex_)
++  std::atomic<bool> swap_waiting_{false};
++  std::atomic<uint64_t> swap_wait_serial_{0};              // the wait going on, or the last one
++  std::atomic<uint64_t> vblank_serial_{0};                 // vblanks given (handler done)
++  // Vblanks begun. A wait can end on what the game's interrupt handler did
++  // before the vblank counts as given: taking vblank_serial_ for "the vblank
++  // that let the last frame go" then named the one before, the next frame
++  // looked late, and got a vblank the moment it waited. A console ran at 61
++  // to 65 frames a second that way, the game a few percent fast.
++  std::atomic<uint64_t> vblank_begun_serial_{0};
++  std::atomic<uint64_t> swap_release_vblank_serial_{0};    // vblank_begun_serial_ when the last wait ended
+ 
+   RegisterFile register_file_;
+   std::unique_ptr<CommandProcessor> command_processor_;
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
 index d26cd4fb..fffad831 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
@@ -390,10 +451,20 @@ index d26cd4fb..fffad831 100644
                                          bool invalidated_by_gpu);
  
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 4d85a2b5..d43cdee7 100644
+index 4d85a2b5..1438d9bf 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
-@@ -34,7 +34,7 @@ class SharedMemory {
+@@ -10,7 +10,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <cstdint>
++#include <memory>
+ #include <mutex>
+ #include <utility>
+ #include <vector>
+@@ -34,7 +36,7 @@ class SharedMemory {
    void SetSystemPageBlocksValidWithGpuDataWritten();
    void InvalidateAllPages();
  
@@ -402,7 +473,7 @@ index 4d85a2b5..d43cdee7 100644
                                        void* context, uint32_t address_first, uint32_t address_last,
                                        bool invalidated_by_gpu);
    typedef void* GlobalWatchHandle;
-@@ -48,7 +48,7 @@ class SharedMemory {
+@@ -48,7 +50,7 @@ class SharedMemory {
    // The callback is called within the global critical region.
    GlobalWatchHandle RegisterGlobalWatch(GlobalWatchCallback callback, void* callback_context);
    void UnregisterGlobalWatch(GlobalWatchHandle handle);
@@ -411,6 +482,289 @@ index 4d85a2b5..d43cdee7 100644
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu);
    typedef void* WatchHandle;
+@@ -179,6 +181,82 @@ class SharedMemory {
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
+ 
++  // [ps5 port] Volatile pages (the shared_memory_volatile_pages setting).
++  //
++  // A page the game writes after it was uploaded is caught by write-protecting
++  // it: the write faults, the page is unprotected and marked not valid, and the
++  // next draw that needs it uploads and protects it again. A page of geometry
++  // the game rewrites every frame goes round that loop every frame, and on the
++  // PS5 a protection change is slow (about 0.1 ms, with the global lock held):
++  // the profile of a console had the command processor in mprotect for a third
++  // of its time and the game's main thread for an eighth.
++  //
++  // So a page that keeps faulting stops being protected. Whether it changed is
++  // found out when a draw asks for it instead, from a 64-bit hash of it kept
++  // from the last upload (16 KB: under a microsecond; the first version kept a
++  // copy and compared, which read twice the memory and took two). What a draw
++  // gets is the same either way: what is in the game's memory when the draw is
++  // made.
++  //
++  // A look costs every time the page is asked for, where a protected page
++  // costs nothing until it is written. So a page asked for many times in a row
++  // without having changed is protected again; having been volatile once, its
++  // next write fault makes it volatile at once. The worst case is then what it
++  // was before, plus those looks. How many: a fault and the protecting that
++  // follows cost about as much as 130 looks, and giving up at the break-even
++  // is the most that can be had without knowing what comes (at 16, a console
++  // had 33 pages a frame going round).
++  //
++  // Only pages nothing else relies on being told about: one a texture watches,
++  // or one the GPU wrote, is protected as before.
++  static constexpr uint8_t kVolatileFaultCount = 3;      // write faults, each within...
++  static constexpr uint64_t kVolatileFaultGapMs = 2000;  // ...this long of the one before
++  static constexpr uint32_t kVolatileQuietCompares = 128; // unchanged in a row: protected again
++  static constexpr uint32_t kVolatileMaxPages = 16384;
++  struct VolatilePage {
++    // In the global critical region:
++    uint64_t fault_ms = 0;  // the last write fault
++    uint8_t faults = 0;     // write faults in a row
++    bool sticky = false;    // has been volatile: the next fault makes it so again
++    // Goes up whenever the page becomes volatile or stops being: a hash kept
++    // under another number is of no use. (Written in the global critical
++    // region, read by the command processor thread outside it.)
++    std::atomic<uint32_t> epoch{0};
++    // The command processor thread's:
++    uint64_t hash = 0;             // of what was last uploaded...
++    uint32_t hash_epoch = 0;       // ...when `epoch` and...
++    uint32_t hash_generation = 0;  // ...volatile_generation_ were these (0: no hash)
++    uint32_t quiet_compares = 0;
++  };
++  static uint64_t VolatileNowMs();
++  bool IsPageVolatile(uint32_t page) const {
++    return (system_page_flags_volatile_[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) &
++           1;
++  }
++  // Both in the global critical region. True if the page's state changed.
++  bool MakePageVolatile(uint32_t page);
++  bool ClearPageVolatile(uint32_t page);
++  // The hash of a page of guest memory as it is now.
++  uint64_t HashGuestPage(uint32_t page) const;
++  // Whether `hash` is the one kept for a volatile page (command processor thread).
++  bool IsVolatilePageHash(uint32_t page, uint64_t hash) const;
++  // Takes out of upload_ranges_ the volatile pages that are what was uploaded
++  // last time (command processor thread, outside the global critical region).
++  void FilterVolatileUploadRanges();
++  bool volatile_pages_enabled_ = false;
++  // Bits written in the global critical region, read outside it too.
++  std::unique_ptr<std::atomic<uint64_t>[]> system_page_flags_volatile_;
++  std::unique_ptr<VolatilePage[]> volatile_pages_;
++  std::atomic<uint32_t> volatile_page_count_{0};
++  // Goes up when every page is invalidated: no hash says anything after that.
++  std::atomic<uint32_t> volatile_generation_{1};
++  // The command processor thread's: the filtered ranges, and what the log
++  // line says.
++  std::vector<std::pair<uint32_t, uint32_t>> volatile_filtered_ranges_;
++  uint64_t volatile_stats_ms_ = 0, volatile_compares_ = 0, volatile_changed_ = 0;
++  uint64_t volatile_quieted_ = 0;
++  std::atomic<uint64_t> volatile_made_{0}, volatile_faults_{0};
++
+   struct GlobalWatch {
+     GlobalWatchCallback callback;
+     void* callback_context;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff481..eb523075 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -143,6 +143,43 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
+                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+ 
++  // [ps5 port] What the GPU's time goes to, while the profiler runs
++  // (rex::ps5diag::ProfilerRunning): a timestamp wherever the kind of work
++  // being recorded changes, and every 30 s a log line with the milliseconds a
++  // frame each kind took ("ps5 gpu:"). The time from one timestamp to the next
++  // is the work between them finishing after the work before it did; the GPU
++  // overlaps neighbouring work a little, so the split is close, not exact.
++  enum class GpuPhase : uint8_t {
++    kDraw,         // the game's draws (and anything not below)
++    kTransfer,     // EDRAM contents copied between host render targets
++    kResolve,      // resolves (render target to memory) and resolve clears
++    kTextureLoad,  // guest texture data made into host textures
++    kUpload,       // guest memory copied to the GPU's copy of it
++    kSwap,         // the frame out to the screen
++    kCount,
++  };
++  void SetGpuPhase(GpuPhase phase);
++  // Whether the open submission's GPU time is being measured (profiling).
++  bool gpu_phase_timing() const { return gpu_phase_timing_; }
++  // An EDRAM transfer between two render targets (their RenderTargetKey
++  // values), for the profiling report: which switches the copies come from.
++  void NoteGpuTransfer(uint32_t source_key, uint32_t dest_key, uint32_t tiles, bool skipped);
++  // Sets a kind of work for as long as it lives, then the one before.
++  class GpuPhaseScope {
++   public:
++    GpuPhaseScope(VulkanCommandProcessor& command_processor, GpuPhase phase)
++        : command_processor_(command_processor), previous_(command_processor.gpu_phase_) {
++      command_processor_.SetGpuPhase(phase);
++    }
++    ~GpuPhaseScope() { command_processor_.SetGpuPhase(previous_); }
++    GpuPhaseScope(const GpuPhaseScope&) = delete;
++    GpuPhaseScope& operator=(const GpuPhaseScope&) = delete;
++
++   private:
++    VulkanCommandProcessor& command_processor_;
++    GpuPhase previous_;
++  };
++
+   // Returns the deferred drawing command list for the currently open
+   // submission.
+   DeferredCommandBuffer& deferred_command_buffer() {
+@@ -727,6 +764,86 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint64_t scratch_buffer_last_usage_submission_ = 0;
+   bool scratch_buffer_used_ = false;
+ 
++  // [ps5 port] How long the GPU spends on each submission: a timestamp at
++  // its start and end, read when its fence is signalled, summed in
++  // rex::ps5diag::kGpuBusyUs (the log's "gpu busy"). Overlapping submissions
++  // are counted once. Null pool: not measured.
++  static constexpr uint32_t kGpuTimestampSlots = 256;
++  void InitializeGpuTimestamps();
++  void ShutdownGpuTimestamps();
++  void ReadGpuTimestamps(uint64_t first_submission, uint64_t last_submission);
++  VkQueryPool gpu_timestamp_pool_ = VK_NULL_HANDLE;
++  double gpu_timestamp_ns_per_tick_ = 0.0;
++  uint64_t gpu_timestamp_mask_ = 0;
++  uint64_t gpu_timestamp_one_second_ = 0;  // in ticks
++  uint64_t gpu_timestamp_last_end_ = 0;
++  double gpu_busy_ns_unreported_ = 0.0;
++  // The submission each slot's two queries belong to (0: free).
++  std::array<uint64_t, kGpuTimestampSlots> gpu_timestamp_slot_submission_{};
++
++  // [ps5 port] GpuPhase timing: per submission a slot of queries, query 0 at
++  // its start, one at each change of the kind of work, one after each draw,
++  // and one at its end. (A slot of 1024 was too few: a heavy scene has 2000
++  // draws a frame, and what came after the last query counted as draws.)
++  static constexpr uint32_t kGpuPhaseSlots = 16;
++  static constexpr uint32_t kGpuPhaseQueriesPerSlot = 16384;
++  static constexpr uint32_t kNoDrawKind = UINT32_MAX;
++  // What tells draws apart in the report: the shaders, and where they draw.
++  struct GpuDrawKind {
++    uint64_t vertex_shader_hash;
++    uint64_t pixel_shader_hash;  // 0: none (depth only)
++    uint32_t msaa_samples;       // xenos::MsaaSamples
++    uint32_t color_format;       // xenos::ColorRenderTargetFormat of RT 0
++    uint32_t surface_pitch;      // guest pixels
++    uint32_t color_mask;         // normalized, 4 bits a render target
++    bool operator==(const GpuDrawKind& other) const {
++      return std::memcmp(this, &other, sizeof(*this)) == 0;
++    }
++  };
++  struct GpuDrawKindHasher {
++    size_t operator()(const GpuDrawKind& kind) const {
++      return size_t(kind.vertex_shader_hash ^ (kind.pixel_shader_hash * 31) ^
++                    (uint64_t(kind.msaa_samples) << 3) ^ (uint64_t(kind.color_format) << 7) ^
++                    (uint64_t(kind.surface_pitch) << 13) ^ (uint64_t(kind.color_mask) << 29));
++    }
++  };
++  struct GpuInterval {
++    GpuPhase phase;
++    uint32_t draw_kind;  // kNoDrawKind: not a draw of its own
++  };
++  void BeginGpuPhaseTiming();
++  // After a draw's commands: the time since the last query is that draw's.
++  void MarkGpuDraw(const GpuDrawKind& kind);
++  void ReadGpuPhases(uint64_t first_submission, uint64_t last_submission);
++  void ReportGpuPhases();
++  VkQueryPool gpu_phase_pool_ = VK_NULL_HANDLE;
++  GpuPhase gpu_phase_ = GpuPhase::kDraw;
++  bool gpu_phase_timing_ = false;  // the open submission is timed
++  uint32_t gpu_phase_slot_ = 0;
++  uint32_t gpu_phase_query_count_ = 0;  // queries the open submission has
++  std::array<uint64_t, kGpuPhaseSlots> gpu_phase_slot_submission_{};  // 0: free
++  // Per slot, what each interval from one query to the next was.
++  std::array<std::vector<GpuInterval>, kGpuPhaseSlots> gpu_phase_slot_intervals_;
++  std::array<double, size_t(GpuPhase::kCount)> gpu_phase_ns_{};  // (draws: what isn't a draw's)
++  std::array<uint64_t, size_t(GpuPhase::kCount)> gpu_phase_entries_{};
++  std::array<uint64_t, 3> gpu_phase_draws_by_msaa_{};  // 1x, 2x, 4x
++  // Draws: by kind (an index into gpu_draw_kinds_), and by how long one took.
++  std::unordered_map<GpuDrawKind, uint32_t, GpuDrawKindHasher> gpu_draw_kind_ids_;
++  std::vector<GpuDrawKind> gpu_draw_kinds_;
++  std::vector<double> gpu_draw_kind_ns_;
++  std::vector<uint64_t> gpu_draw_kind_count_;
++  static constexpr size_t kGpuDrawBuckets = 5;  // under 10, 50, 200, 1000 us, and more
++  std::array<double, kGpuDrawBuckets> gpu_draw_bucket_ns_{};
++  std::array<uint64_t, kGpuDrawBuckets> gpu_draw_bucket_count_{};
++  double gpu_draw_ns_ = 0.0;
++  uint64_t gpu_draw_count_ = 0;
++  // Transfers by (source key << 32 | dest key): how many, and EDRAM tiles.
++  struct GpuTransferStats {
++    uint64_t count = 0, tiles = 0, skipped = 0;
++  };
++  std::unordered_map<uint64_t, GpuTransferStats> gpu_transfer_stats_;
++  uint64_t gpu_phase_report_ms_ = 0, gpu_phase_report_swaps_ = 0;
++
+   static constexpr uint32_t kMaxOcclusionQueries = 8192;
+   VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
+   VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a8485..95b5ada9 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -265,6 +265,16 @@ class DeferredCommandBuffer {
+   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
+   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+ 
++  // [ps5 port] (the GPU time of what is recorded: VulkanCommandProcessor::SetGpuPhase)
++  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
++                           uint32_t query) {
++    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
++        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
++    args.pipeline_stage = pipeline_stage;
++    args.query_pool = query_pool;
++    args.query = query;
++  }
++
+   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
+     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
+         WriteCommand(Command::kVkResetQueryPool, sizeof(ArgsVkResetQueryPool)));
+@@ -381,6 +391,7 @@ class DeferredCommandBuffer {
+     kVkSetStencilReference,
+     kVkSetStencilWriteMask,
+     kVkSetViewport,
++    kVkWriteTimestamp,
+   };
+ 
+   struct CommandHeader {
+@@ -520,6 +531,12 @@ class DeferredCommandBuffer {
+     uint32_t query;
+   };
+ 
++  struct ArgsVkWriteTimestamp {
++    VkPipelineStageFlagBits pipeline_stage;
++    VkQueryPool query_pool;
++    uint32_t query;
++  };
++
+   struct ArgsVkResetQueryPool {
+     VkQueryPool query_pool;
+     uint32_t first_query;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f70337..311565d6 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <string>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -32,6 +33,10 @@ class VulkanCommandProcessor;
+ 
+ class VulkanRenderTargetCache final : public RenderTargetCache {
+  public:
++  // [ps5 port] A RenderTargetKey value in words, for the profiling report:
++  // what it holds, where in the EDRAM it starts, its pitch and MSAA.
++  static std::string DescribeKeyForLog(uint32_t key_value);
++
+   union RenderPassKey {
+     struct {
+       // If emulating 2x as 4x, this is still 2x for simplicity of using this
 diff --git a/include/rex/input/ps5/ps5_input_driver.h b/include/rex/input/ps5/ps5_input_driver.h
 new file mode 100644
 index 00000000..870db03b
@@ -564,10 +918,10 @@ index 00000000..85c3c3ca
 +#endif  // __PROSPERO__
 diff --git a/include/rex/ps5_diag.h b/include/rex/ps5_diag.h
 new file mode 100644
-index 00000000..6d0d83bc
+index 00000000..fca0e473
 --- /dev/null
 +++ b/include/rex/ps5_diag.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +/**
 + * @file        rex/ps5_diag.h
@@ -596,6 +950,8 @@ index 00000000..6d0d83bc
 +  kWritePointer,      // ring buffer write pointer updates by the game
 +  kPrimaryBuffers,    // ring buffer batches executed
 +  kSwaps,             // frames the game presented
++  kGpuBusyUs,         // microseconds the GPU spent on the game's submissions
++  kGpuWaitUs,         // microseconds the command processor waited for the GPU
 +  kCount
 +};
 +
@@ -603,6 +959,7 @@ index 00000000..6d0d83bc
 +extern std::atomic<uint64_t> counters[kCount];
 +inline void Add(Counter c) { counters[c].fetch_add(1, std::memory_order_relaxed); }
 +inline uint64_t Get(Counter c) { return counters[c].load(std::memory_order_relaxed); }
++inline void AddN(Counter c, uint64_t n) { counters[c].fetch_add(n, std::memory_order_relaxed); }
 +
 +// The reserved guest address space (all views live inside it).
 +extern uintptr_t guest_arena_lo, guest_arena_hi;
@@ -618,6 +975,15 @@ index 00000000..6d0d83bc
 +// Before the calling thread exits: out of the samples.
 +void UnregisterThread();
 +void SampleAllThreads();
++
++// Where the time goes: every 10 ms each registered thread is asked (SIGPROF)
++// where it is, and every `report_seconds` the log gets, for each thread that
++// used the processor, how much of one core it used and the places it was
++// found at most ("ps5 prof:" lines, addresses as in the stack lines;
++// ps5/tools/ps5_symbolize.py names them). Costs a few percent while it runs.
++void StartProfiler(int report_seconds);
++// Whether StartProfiler was called (others then measure more, too).
++bool ProfilerRunning();
 +
 +// A host fault no handler took (a crash in some thread): the first one is
 +// written to the end of the log file with the thread's return addresses
@@ -639,6 +1005,8 @@ index 00000000..6d0d83bc
 +uintptr_t Anchor();
 +#else
 +inline void Add(Counter) {}
++inline void AddN(Counter, uint64_t) {}
++inline bool ProfilerRunning() { return false; }
 +#endif
 +
 +}  // namespace rex::ps5diag
@@ -988,6 +1356,26 @@ index 00000000..61d85885
 +
 +}  // namespace ui
 +}  // namespace rex
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a2..52cdebef 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -28,6 +28,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdResetQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetBlendConstants)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetScissor)
++XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilCompareMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilReference)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilWriteMask)
+@@ -71,6 +72,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
+ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
++XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
 diff --git a/include/rex/ui/vulkan/functions/instance_khr_display.inc b/include/rex/ui/vulkan/functions/instance_khr_display.inc
 new file mode 100644
 index 00000000..4df17f05
@@ -2033,19 +2421,24 @@ index d639924c..7f325c0c 100644
  }  // namespace rex::thread
 diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
 new file mode 100644
-index 00000000..0be66022
+index 00000000..c19254b6
 --- /dev/null
 +++ b/src/core/ps5_diag.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,388 @@
 +// [ps5 port] see rex/ps5_diag.h
 +#include <rex/ps5_diag.h>
 +
 +#if REX_PLATFORM_PS5
 +
++#include <algorithm>
 +#include <cstdio>
 +#include <cstring>
++#include <ctime>
 +#include <mutex>
 +#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
 +
 +#include <fcntl.h>
 +#include <pthread.h>
@@ -2085,6 +2478,11 @@ index 00000000..0be66022
 +  uintptr_t rip = 0, rsp = 0;
 +  uintptr_t words[64] = {};
 +  int nwords = 0;
++  // the profiler's (StartProfiler): where the thread was at the last sample
++  std::atomic<bool> want_prof{false};
++  std::atomic<uint32_t> prof_seq{0};
++  uintptr_t prof_rip = 0, prof_caller = 0;
++  uint64_t prof_cpu_ns = 0;
 +};
 +constexpr int kThreads = 192;
 +ThreadEntry threads[kThreads];
@@ -2104,8 +2502,34 @@ index 00000000..0be66022
 +// rip in its slot 20 and rsp in slot 23.
 +void SampleHandler(int, siginfo_t*, void* uc) {
 +  ThreadEntry* e = my_entry;
-+  if (!e || !e->want_stack.exchange(false, std::memory_order_acq_rel)) return;
++  if (!e) return;
 +  auto* gregs = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(uc) + 64);
++  if (e->want_prof.exchange(false, std::memory_order_acq_rel)) {
++    // The profiler's sample: where the thread is and, when that is outside the
++    // program (the C library, the kernel's, the system's), the nearest return
++    // address into the program on its stack; and the processor time it has used.
++    const uintptr_t rip = gregs[20], rsp = gregs[23];
++    uintptr_t caller = 0;
++    if (!InProgram(rip)) {
++      uintptr_t end = rsp + 4096;
++      if (e->stack_top && e->stack_top < end) end = e->stack_top;
++      for (uintptr_t p = rsp & ~uintptr_t(7); p + 8 <= end; p += 8) {
++        const uintptr_t v = *reinterpret_cast<uintptr_t*>(p);
++        if (InProgram(v)) {
++          caller = v;
++          break;
++        }
++      }
++    }
++    timespec used{};
++    e->prof_cpu_ns = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &used) == 0
++                         ? uint64_t(used.tv_sec) * 1000000000ull + uint64_t(used.tv_nsec)
++                         : 0;
++    e->prof_rip = rip;
++    e->prof_caller = caller;
++    e->prof_seq.fetch_add(1, std::memory_order_release);
++  }
++  if (!e->want_stack.exchange(false, std::memory_order_acq_rel)) return;
 +  e->rip = gregs[20];
 +  e->rsp = gregs[23];
 +  uintptr_t end = e->rsp + 64 * 1024;
@@ -2216,6 +2640,117 @@ index 00000000..0be66022
 +    }
 +    REXLOG_INFO("ps5 stack: tid {} {}: rip {:X} |{}", e.tid, e.what, e.rip - Anchor() + 0x10000000, line);
 +  }
++}
++
++namespace {
++
++// One thread's samples since the last report.
++struct ProfThread {
++  uint32_t seq = 0;
++  uint64_t samples = 0, outside = 0, cpu_ns_at_report = 0, cpu_ns = 0;
++  bool have_cpu = false;
++  // where (program-relative, as logged; for a place outside the program, the
++  // caller in the program with the top bit set) -> times found there
++  std::unordered_map<uint64_t, uint32_t> places;
++};
++
++void ProfilerThread(int report_seconds) {
++  constexpr uint64_t kOutside = 1ull << 63;
++  constexpr size_t kTop = 14, kTopBusy = 150;  // (more for a thread that used half a core)
++  // Places 16 bytes apart are one place: a hot loop is a few of these, not
++  // dozens of instructions each with its own count.
++  constexpr uint64_t kPlaceMask = ~uint64_t(15);
++  std::vector<ProfThread> prof(kThreads);
++  uint64_t report_at = NowMs() + uint64_t(report_seconds) * 1000, window_start = NowMs();
++  uint64_t swaps_at_report = Get(kSwaps), gpu_busy_at_report = Get(kGpuBusyUs);
++  REXLOG_INFO("ps5 prof: sampling every 10 ms, a report every {} s; anchor {:X}", report_seconds, Anchor());
++  for (;;) {
++    int count = next_thread.load();
++    if (count > kThreads) count = kThreads;
++    for (int i = 0; i < count; ++i) {
++      ThreadEntry& e = threads[i];
++      if (!e.used.load(std::memory_order_acquire)) continue;
++      e.want_prof.store(true, std::memory_order_release);
++      pthread_kill(e.pthread, SIGPROF);
++    }
++    usleep(10000);
++    for (int i = 0; i < count; ++i) {
++      ThreadEntry& e = threads[i];
++      ProfThread& t = prof[i];
++      const uint32_t seq = e.prof_seq.load(std::memory_order_acquire);
++      if (seq == t.seq) continue;  // (no answer this time: masked, or gone)
++      t.seq = seq;
++      const uintptr_t rip = e.prof_rip, caller = e.prof_caller;
++      t.cpu_ns = e.prof_cpu_ns;
++      if (!t.have_cpu) {
++        t.have_cpu = true;
++        t.cpu_ns_at_report = t.cpu_ns;
++      }
++      ++t.samples;
++      if (InProgram(rip)) {
++        ++t.places[uint64_t(rip - Anchor() + 0x10000000) & kPlaceMask];
++      } else {
++        ++t.outside;
++        ++t.places[kOutside | (caller ? uint64_t(caller - Anchor() + 0x10000000) : 0)];
++      }
++    }
++    const uint64_t now = NowMs();
++    if (now < report_at) continue;
++    const double seconds = double(now - window_start) / 1000.0;
++    const uint64_t swaps = Get(kSwaps);
++    const uint64_t gpu_busy = Get(kGpuBusyUs);
++    REXLOG_INFO("ps5 prof: {:.1f} s, {:.1f} frames/s, gpu busy {:.0f}%. Per thread: % of one core "
++                "used, samples, % of them outside the program, then place*count (~place: outside "
++                "the program, called from there)",
++                seconds, double(swaps - swaps_at_report) / seconds,
++                double(gpu_busy - gpu_busy_at_report) / (seconds * 1e4));
++    swaps_at_report = swaps;
++    gpu_busy_at_report = gpu_busy;
++    for (int i = 0; i < count; ++i) {
++      ProfThread& t = prof[i];
++      if (!t.samples) continue;
++      const double core = double(t.cpu_ns - t.cpu_ns_at_report) / (seconds * 1e9) * 100.0;
++      // (threads that did next to nothing are left out: the log stays readable)
++      if (core >= 2.0 || !t.cpu_ns) {
++        std::vector<std::pair<uint64_t, uint32_t>> top(t.places.begin(), t.places.end());
++        const size_t keep = std::min<size_t>(top.size(), core >= 50.0 ? kTopBusy : kTop);
++        std::partial_sort(top.begin(), top.begin() + std::ptrdiff_t(keep), top.end(),
++                          [](const auto& a, const auto& b) { return a.second > b.second; });
++        std::string line;
++        for (size_t k = 0; k < keep; ++k) {
++          char buf[40];
++          std::snprintf(buf, sizeof(buf), " %s%lX*%u", top[k].first & kOutside ? "~" : "",
++                        static_cast<unsigned long>(top[k].first & ~kOutside), top[k].second);
++          line += buf;
++        }
++        REXLOG_INFO("ps5 prof: tid {} {}: core {:.0f}% samples {} outside {:.0f}% |{}", threads[i].tid,
++                    threads[i].what, core, t.samples, 100.0 * double(t.outside) / double(t.samples), line);
++      }
++      t.samples = t.outside = 0;
++      t.cpu_ns_at_report = t.cpu_ns;
++      t.places.clear();
++    }
++    rex::FlushLogging();
++    window_start = NowMs();
++    report_at = window_start + uint64_t(report_seconds) * 1000;
++  }
++}
++
++}  // namespace
++
++namespace {
++std::atomic<bool> profiler_running{false};
++}  // namespace
++
++bool ProfilerRunning() { return profiler_running.load(std::memory_order_relaxed); }
++
++void StartProfiler(int report_seconds) {
++  static std::once_flag once;
++  std::call_once(once, [report_seconds] {
++    profiler_running.store(true, std::memory_order_relaxed);
++    InstallSampleHandler();
++    std::thread(ProfilerThread, report_seconds < 5 ? 5 : report_seconds).detach();
++  });
 +}
 +
 +void SetLogPath(const char* path) {
@@ -2464,7 +2999,7 @@ index fd06c662..140a0042 100644
    return value;
  }
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index bed1e59c..d953b3ea 100644
+index bed1e59c..90d66b44 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -66,7 +66,9 @@ uint32_t NxKernelPriority() {
@@ -2611,7 +3146,23 @@ index bed1e59c..d953b3ea 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
-@@ -694,11 +769,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -457,8 +532,13 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // [ps5 port] The time left, not its whole milliseconds: with under a
++        // millisecond to go (every alertable wait: it comes here a millisecond
++        // at a time) that was 0, and the loop span through the whole wait
++        // without sleeping. The game's audio thread, which waits on nine
++        // handles, used three quarters of a core that way.
++        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(end_time - now);
++        auto sleep_time = std::min(remaining, std::chrono::microseconds(1000));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+@@ -694,11 +774,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
      pthread_attr_t attr;
      if (pthread_attr_init(&attr) != 0)
        return false;
@@ -2640,7 +3191,7 @@ index bed1e59c..d953b3ea 100644
        sched_param sched{};
        sched.sched_priority = params.initial_priority + 1;
        if (pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != 0) {
-@@ -710,7 +801,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -710,7 +806,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -2657,7 +3208,7 @@ index bed1e59c..d953b3ea 100644
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -726,6 +825,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -726,6 +830,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
          exit_code_(0),
          state_(State::kRunning),
          suspend_count_(0) {
@@ -2668,7 +3219,7 @@ index bed1e59c..d953b3ea 100644
  #if defined(__APPLE__)
      suspend_sem_ = RexCreateAnonymousSemaphore();
  #else
-@@ -761,6 +864,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -761,6 +869,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
          std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
          rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
        }
@@ -2677,7 +3228,7 @@ index bed1e59c..d953b3ea 100644
  #else
        if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
          assert_always();
-@@ -779,6 +884,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -779,6 +889,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
        if (pthread_equal(thread_, pthread_self())) {
          pthread_setname_np(std::string(name).c_str());
        }
@@ -2686,7 +3237,7 @@ index bed1e59c..d953b3ea 100644
  #else
        pthread_setname_np(thread_, std::string(name).c_str());
  #endif
-@@ -810,13 +917,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -810,13 +922,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
  #if defined(__APPLE__)
    uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
@@ -2704,7 +3255,7 @@ index bed1e59c..d953b3ea 100644
      // macOS doesn't expose Linux-style pthread affinity masks; report every
      // logical processor as available.
      auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
-@@ -847,7 +957,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -847,7 +962,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_affinity_mask(uint64_t mask) {
      WaitStarted();
@@ -2713,7 +3264,7 @@ index bed1e59c..d953b3ea 100644
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
      (void)mask;
-@@ -885,8 +995,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -885,8 +1000,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_priority(int new_priority) {
      WaitStarted();
@@ -2726,7 +3277,7 @@ index bed1e59c..d953b3ea 100644
      return;
  #endif
      sched_param param{};
-@@ -924,7 +1036,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -924,7 +1041,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -2735,7 +3286,7 @@ index bed1e59c..d953b3ea 100644
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -1037,6 +1149,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1037,6 +1154,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
        cond_.notify_all();
      }
      if (is_current_thread) {
@@ -2745,7 +3296,7 @@ index bed1e59c..d953b3ea 100644
        pthread_exit(reinterpret_cast<void*>(exit_code));
      } else {
  #if REX_PLATFORM_ANDROID
-@@ -1071,7 +1186,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1071,7 +1191,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
    inline bool signaled() const override { return signaled_; }
    inline void post_execution() override {
      if (thread_) {
@@ -2760,7 +3311,7 @@ index bed1e59c..d953b3ea 100644
      }
  #if defined(__APPLE__)
      if (suspend_sem_ != SEM_FAILED) {
-@@ -1085,6 +1207,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1085,6 +1212,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
    pthread_t thread_;
  #if REX_PLATFORM_NX
    nn::os::ThreadType* nn_thread_ = nullptr;  // N4: set by ThreadStartRoutine before start is published
@@ -2772,7 +3323,7 @@ index bed1e59c..d953b3ea 100644
  #endif
    bool signaled_;
    int exit_code_;
-@@ -1481,6 +1608,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1481,6 +1613,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
  
    current_thread_ = thread;
    current_thread_condition_ = &thread->handle_;
@@ -2783,7 +3334,7 @@ index bed1e59c..d953b3ea 100644
  #if REX_PLATFORM_NX
    thread->handle_.nn_thread_ = nn::os::GetCurrentThread();
    if (NxPrioEnabled()) {
-@@ -1515,6 +1646,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1515,6 +1651,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
    }
  
    start_routine();
@@ -2793,7 +3344,7 @@ index bed1e59c..d953b3ea 100644
  
    {
      std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-@@ -1588,6 +1722,8 @@ void Thread::Exit(int exit_code) {
+@@ -1588,6 +1727,8 @@ void Thread::Exit(int exit_code) {
  void set_current_thread_name(const std::string_view name) {
  #if defined(__APPLE__)
    pthread_setname_np(std::string(name).c_str());
@@ -3034,7 +3585,7 @@ index 0d8f8af0..e75b77f4 100644
  
  set_target_properties(rexgpu-xenos PROPERTIES
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 2266c728..dd156125 100644
+index 2266c728..15eb5729 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -3061,8 +3612,42 @@ index 2266c728..dd156125 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
+@@ -1022,8 +1025,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
++  // [ps5 port] Told to the vblank thread while this waits (adaptive vsync,
++  // rex/graphics/graphics_system.h), and the wait itself ends with the vblank
++  // instead of up to a millisecond after it.
++  struct SwapWait {
++    GraphicsSystem* graphics_system = nullptr;
++    ~SwapWait() {
++      if (graphics_system) graphics_system->EndSwapWait();
++    }
++  } swap_wait;
++
+   bool matched = false;
+   do {
++    const uint64_t vblank_serial_seen = graphics_system_ ? graphics_system_->vblank_serial() : 0;
+     uint32_t value = 0;
+     if (is_memory) {
+       value =
+@@ -1069,6 +1083,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
++        } else if (graphics_system_) {
++          if (!swap_wait.graphics_system) {
++            swap_wait.graphics_system = graphics_system_;
++            graphics_system_->BeginSwapWait();
++          }
++          graphics_system_->WaitForVblankAfter(vblank_serial_seen,
++                                               std::chrono::milliseconds(wait / 0x100));
+         } else {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0b..d95eff1d 100644
+index 8f2fcb0b..4423ae36 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -10,6 +10,7 @@
@@ -3073,7 +3658,68 @@ index 8f2fcb0b..d95eff1d 100644
  
  #include <algorithm>
  #include <cctype>
-@@ -298,6 +299,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -35,6 +36,16 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// [ps5 port] rex/graphics/graphics_system.h, "Adaptive vsync".
++#if REX_PLATFORM_PS5
++#define REX_VSYNC_ADAPTIVE_DEFAULT true
++#else
++#define REX_VSYNC_ADAPTIVE_DEFAULT false
++#endif
++REXCVAR_DEFINE_BOOL(vsync_adaptive, REX_VSYNC_ADAPTIVE_DEFAULT, "GPU",
++                    "With vsync: a frame that missed its vblank is shown when it is ready, not a "
++                    "whole vblank later");
++
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+@@ -158,15 +169,42 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        uint64_t early_given_for_wait = 0;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          bool given = false;
++          // [ps5 port] Adaptive vsync: a frame is waiting for a vblank and one
++          // has gone by since the last frame was let go, so this one is late.
++          // It gets its vblank now (once), and the interval counts from here.
++          if (REXCVAR_GET(vsync) && REXCVAR_GET(vsync_adaptive) &&
++              swap_waiting_.load(std::memory_order_acquire)) {
++            const uint64_t wait_serial = swap_wait_serial_.load(std::memory_order_acquire);
++            if (wait_serial != early_given_for_wait &&
++                vblank_begun_serial_.load(std::memory_order_acquire) !=
++                    swap_release_vblank_serial_.load(std::memory_order_acquire)) {
++              early_given_for_wait = wait_serial;
++              MarkVblank();
++              last_frame_time = current_time;
++              given = true;
++            }
++          }
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
+             last_frame_time += interval_ticks;
++            given = true;
++          }
++          if (given) {
++            // (a waiting command processor looks again at once)
++            std::lock_guard<std::mutex> lock(vsync_mutex_);
++            vblank_given_.notify_all();
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
++          // A millisecond, or less when a frame starts waiting.
++          std::unique_lock<std::mutex> lock(vsync_mutex_);
++          vsync_wake_.wait_for(lock, std::chrono::milliseconds(1),
++                               [this] { return vsync_wake_requested_; });
++          vsync_wake_requested_ = false;
+         }
+         return 0;
+       }));
+@@ -298,6 +336,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
    if (!interrupt_callback_) {
      return;
    }
@@ -3081,14 +3727,51 @@ index 8f2fcb0b..d95eff1d 100644
  
    auto thread = system::XThread::GetCurrentThread();
    assert_not_null(thread);
-@@ -320,6 +322,7 @@ void GraphicsSystem::MarkVblank() {
+@@ -316,10 +355,34 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+                                          rex::countof(args));
+ }
+ 
++void GraphicsSystem::BeginSwapWait() {
++  swap_wait_serial_.fetch_add(1, std::memory_order_acq_rel);
++  swap_waiting_.store(true, std::memory_order_release);
++  std::lock_guard<std::mutex> lock(vsync_mutex_);
++  vsync_wake_requested_ = true;
++  vsync_wake_.notify_one();
++}
++
++void GraphicsSystem::EndSwapWait() {
++  swap_release_vblank_serial_.store(vblank_begun_serial_.load(std::memory_order_acquire),
++                                    std::memory_order_release);
++  swap_waiting_.store(false, std::memory_order_release);
++}
++
++void GraphicsSystem::WaitForVblankAfter(uint64_t serial_seen, std::chrono::milliseconds timeout) {
++  std::unique_lock<std::mutex> lock(vsync_mutex_);
++  vblank_given_.wait_for(lock, timeout, [this, serial_seen] {
++    return vblank_serial_.load(std::memory_order_acquire) != serial_seen;
++  });
++}
++
+ void GraphicsSystem::MarkVblank() {
    // TODO: Enable profiling once ported
    // SCOPE_profile_cpu_f("gpu");
  
 +  rex::ps5diag::Add(rex::ps5diag::kVblanks);
++  // [ps5 port] (before the game's interrupt handler: see vblank_begun_serial_)
++  vblank_begun_serial_.fetch_add(1, std::memory_order_acq_rel);
    // Increment vblank counter (so the game sees us making progress).
    if (command_processor_) {
      command_processor_->increment_counter();
+@@ -329,6 +392,9 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   DispatchInterruptCallback(0, 2);
++  // [ps5 port] (after the game's interrupt handler ran: whoever waits for this
++  // vblank finds what the handler did)
++  vblank_serial_.fetch_add(1, std::memory_order_acq_rel);
+ }
+ 
+ void GraphicsSystem::ClearCaches() {
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 76f5600c..989fc100 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
@@ -3138,8 +3821,364 @@ index 76f5600c..989fc100 100644
      uint32_t address_last, bool invalidated_by_gpu) {
    assert_true(IsDrawResolutionScaled());
    if (invalidated_by_gpu) {
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c8..43f00e7b 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -15,10 +15,27 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/bit.h>
++#include <rex/chrono/clock.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
++#include <rex/platform.h>
++
++#include <xxhash.h>
++
++// [ps5 port] rex/graphics/shared_memory.h, "Volatile pages".
++#if REX_PLATFORM_PS5
++#define REX_VOLATILE_PAGES_DEFAULT true
++#else
++#define REX_VOLATILE_PAGES_DEFAULT false
++#endif
++REXCVAR_DEFINE_BOOL(shared_memory_volatile_pages, REX_VOLATILE_PAGES_DEFAULT, "GPU",
++                    "Pages of GPU-visible memory the game keeps rewriting are compared when a draw "
++                    "uses them instead of being write-protected again each time")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::graphics {
+ 
+@@ -34,6 +51,19 @@ void SharedMemory::InitializeCommon() {
+   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
+   system_page_flags_valid_.assign(num_system_page_flags_, 0);
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
++  // [ps5 port] volatile pages
++  volatile_pages_enabled_ = REXCVAR_GET(shared_memory_volatile_pages);
++  system_page_flags_volatile_ = std::make_unique<std::atomic<uint64_t>[]>(num_system_page_flags_);
++  for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
++    system_page_flags_volatile_[i].store(0, std::memory_order_relaxed);
++  }
++  volatile_pages_ = std::make_unique<VolatilePage[]>(kBufferSize >> page_size_log2_);
++  volatile_page_count_ = 0;
++  if (volatile_pages_enabled_) {
++    REXGPU_INFO("Shared memory: pages that keep being rewritten are hashed, not write-protected "
++                "({} KB pages)",
++                (uint32_t(1) << page_size_log2_) >> 10);
++  }
+ 
+   memory_invalidation_callback_handle_ =
+       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
+@@ -82,6 +112,11 @@ void SharedMemory::ShutdownCommon() {
+   host_gpu_memory_sparse_allocated_.shrink_to_fit();
+   host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
+ 
++  // [ps5 port] volatile pages
++  volatile_pages_.reset();
++  system_page_flags_volatile_.reset();
++  volatile_page_count_ = 0;
++
+   system_page_flags_valid_.clear();
+   system_page_flags_valid_.shrink_to_fit();
+   system_page_flags_valid_and_gpu_written_.clear();
+@@ -90,6 +125,8 @@ void SharedMemory::ShutdownCommon() {
+ }
+ 
+ void SharedMemory::InvalidateAllPages() {
++  // [ps5 port] (the hashes kept of volatile pages say nothing after this)
++  volatile_generation_.fetch_add(1, std::memory_order_relaxed);
+   auto global_lock = global_critical_region_.Acquire();
+ 
+   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
+@@ -168,6 +205,26 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
+ 
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  // [ps5 port] Whoever watches a range is told when it is written, and a
++  // volatile page tells nobody: such pages are protected again. The watcher
++  // has just asked for the range, so the page is what was uploaded, unless it
++  // was written since: protected first, then looked at, and left not valid if
++  // it was.
++  if (volatile_page_count_.load(std::memory_order_relaxed)) {
++    for (uint32_t page = watch_page_first; page <= watch_page_last; ++page) {
++      if (!IsPageVolatile(page)) {
++        continue;
++      }
++      const uint64_t hash_before = HashGuestPage(page);
++      const bool unchanged_before = IsVolatilePageHash(page, hash_before);
++      ClearPageVolatile(page);
++      MakeRangeValid(page << page_size_log2_, uint32_t(1) << page_size_log2_, false);
++      if (!unchanged_before || HashGuestPage(page) != hash_before) {
++        system_page_flags_valid_[page >> 6] &= ~(uint64_t(1) << (page & 63));
++      }
++    }
++  }
++
+   // Allocate the range.
+   WatchRange* range = watch_range_first_free_;
+   if (range != nullptr) {
+@@ -306,13 +363,162 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
+       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
+       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+     }
++
++    // [ps5 port] What the GPU wrote is in no copy of ours and has to be
++    // caught when the CPU writes over it: those pages are protected.
++    if (written_by_gpu && volatile_page_count_.load(std::memory_order_relaxed)) {
++      for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
++        ClearPageVolatile(page);
++      }
++    }
+   }
+ 
+   if (memory_invalidation_callback_handle_) {
+-    memory().EnablePhysicalMemoryAccessCallbacks(
+-        valid_page_first << page_size_log2_,
+-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
++    if (!volatile_page_count_.load(std::memory_order_relaxed)) {
++      memory().EnablePhysicalMemoryAccessCallbacks(
++          valid_page_first << page_size_log2_,
++          (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
++    } else {
++      // [ps5 port] The runs of pages between the volatile ones (which are
++      // compared when used, not protected).
++      uint32_t run_first = UINT32_MAX;
++      for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
++        if (!IsPageVolatile(page)) {
++          if (run_first == UINT32_MAX) {
++            run_first = page;
++          }
++          continue;
++        }
++        if (run_first != UINT32_MAX) {
++          memory().EnablePhysicalMemoryAccessCallbacks(run_first << page_size_log2_,
++                                                       (page - run_first) << page_size_log2_, true,
++                                                       false);
++          run_first = UINT32_MAX;
++        }
++      }
++      if (run_first != UINT32_MAX) {
++        memory().EnablePhysicalMemoryAccessCallbacks(
++            run_first << page_size_log2_, (valid_page_last + 1 - run_first) << page_size_log2_,
++            true, false);
++      }
++    }
++  }
++}
++
++uint64_t SharedMemory::VolatileNowMs() {
++  const uint64_t per_ms = rex::chrono::Clock::QueryHostTickFrequency() / 1000;
++  return per_ms ? rex::chrono::Clock::QueryHostTickCount() / per_ms : 0;
++}
++
++bool SharedMemory::MakePageVolatile(uint32_t page) {
++  const uint64_t bit = uint64_t(1) << (page & 63);
++  std::atomic<uint64_t>& block = system_page_flags_volatile_[page >> 6];
++  if ((block.load(std::memory_order_relaxed) & bit) ||
++      (system_page_flags_valid_and_gpu_written_[page >> 6] & bit) ||
++      volatile_page_count_.load(std::memory_order_relaxed) >= kVolatileMaxPages) {
++    return false;
++  }
++  VolatilePage& info = volatile_pages_[page];
++  info.sticky = true;
++  info.epoch.fetch_add(1, std::memory_order_relaxed);
++  block.fetch_or(bit, std::memory_order_relaxed);
++  volatile_page_count_.fetch_add(1, std::memory_order_relaxed);
++  volatile_made_.fetch_add(1, std::memory_order_relaxed);
++  return true;
++}
++
++bool SharedMemory::ClearPageVolatile(uint32_t page) {
++  const uint64_t bit = uint64_t(1) << (page & 63);
++  std::atomic<uint64_t>& block = system_page_flags_volatile_[page >> 6];
++  if (!(block.load(std::memory_order_relaxed) & bit)) {
++    return false;
++  }
++  block.fetch_and(~bit, std::memory_order_relaxed);
++  VolatilePage& info = volatile_pages_[page];
++  info.faults = 0;
++  info.epoch.fetch_add(1, std::memory_order_relaxed);
++  volatile_page_count_.fetch_sub(1, std::memory_order_relaxed);
++  return true;
++}
++
++uint64_t SharedMemory::HashGuestPage(uint32_t page) const {
++  return XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_),
++                     size_t(1) << page_size_log2_);
++}
++
++bool SharedMemory::IsVolatilePageHash(uint32_t page, uint64_t hash) const {
++  const VolatilePage& info = volatile_pages_[page];
++  return info.hash == hash && info.hash_epoch == info.epoch.load(std::memory_order_relaxed) &&
++         info.hash_generation == volatile_generation_.load(std::memory_order_relaxed);
++}
++
++void SharedMemory::FilterVolatileUploadRanges() {
++  volatile_filtered_ranges_.clear();
++  auto keep = [this](uint32_t page) {
++    if (!volatile_filtered_ranges_.empty()) {
++      std::pair<uint32_t, uint32_t>& last = volatile_filtered_ranges_.back();
++      if (last.first + last.second == page) {
++        ++last.second;
++        return;
++      }
++    }
++    volatile_filtered_ranges_.emplace_back(page, 1);
++  };
++  for (const std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
++    for (uint32_t page = range.first; page < range.first + range.second; ++page) {
++      if (!IsPageVolatile(page)) {
++        // Uploaded and protected the usual way.
++        keep(page);
++        continue;
++      }
++      VolatilePage& info = volatile_pages_[page];
++      // (read before the page: the hash is kept under these numbers, and if
++      // the page stops being volatile meanwhile it is never used)
++      const uint32_t epoch = info.epoch.load(std::memory_order_relaxed);
++      const uint32_t generation = volatile_generation_.load(std::memory_order_relaxed);
++      // The hash is taken before the upload reads the page: if the game writes
++      // in between, it is of the older of the two and the next look finds the
++      // difference.
++      const uint64_t hash = HashGuestPage(page);
++      ++volatile_compares_;
++      if (IsVolatilePageHash(page, hash)) {
++        if (++info.quiet_compares < kVolatileQuietCompares) {
++          // What was uploaded last time: nothing to do.
++          continue;
++        }
++        // Asked for over and over without a change: protecting it is the
++        // cheaper way now. Uploaded once more below, which marks it valid and
++        // protects it before reading it.
++        {
++          auto global_lock = global_critical_region_.Acquire();
++          ClearPageVolatile(page);
++        }
++        ++volatile_quieted_;
++        keep(page);
++        continue;
++      }
++      // Changed, or seen for the first time.
++      info.hash = hash;
++      info.hash_epoch = epoch;
++      info.hash_generation = generation;
++      info.quiet_compares = 0;
++      ++volatile_changed_;
++      keep(page);
++    }
+   }
++  upload_ranges_.swap(volatile_filtered_ranges_);
++
++  // A line in the log every 30 s.
++  const uint64_t now_ms = VolatileNowMs();
++  if (now_ms - volatile_stats_ms_ < 30000) {
++    return;
++  }
++  volatile_stats_ms_ = now_ms;
++  REXGPU_INFO("Shared memory: {} volatile pages; since the start {} made, {} protected again, {} "
++              "looks of which {} found a change, {} write faults",
++              volatile_page_count_.load(std::memory_order_relaxed),
++              volatile_made_.load(std::memory_order_relaxed), volatile_quieted_, volatile_compares_,
++              volatile_changed_, volatile_faults_.load(std::memory_order_relaxed));
+ }
+ 
+ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+@@ -413,6 +619,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+       uint32_t range_start = UINT32_MAX;
+       for (uint32_t i = block_first; i <= block_last; ++i) {
+         uint64_t block_valid = system_page_flags_valid_[i];
++        // [ps5 port] A volatile page is looked at every time
++        // (FilterVolatileUploadRanges, below).
++        block_valid &= ~system_page_flags_volatile_[i].load(std::memory_order_relaxed);
+         // Consider pages in the block outside the requested range valid.
+         if (i == block_first) {
+           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
+@@ -465,6 +674,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++  // [ps5 port] Of the volatile pages, only the ones that changed.
++  if (volatile_page_count_.load(std::memory_order_relaxed)) {
++    FilterVolatileUploadRanges();
++    if (upload_ranges_.empty()) {
++      return true;
++    }
++  }
++
+   return UploadRanges(upload_ranges_);
+ }
+ 
+@@ -494,6 +711,46 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+ 
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  // [ps5 port] Volatile pages. A write fault comes for one host page, not as
++  // an exact range; one that keeps coming (or the first, for a page that has
++  // been volatile before) makes the page volatile. The fault unprotects it,
++  // and it isn't protected again.
++  // (two pages when the faulting host page straddles them: the 0xE0000000
++  // view is 4 KB off the others)
++  const bool volatile_write_fault =
++      volatile_pages_enabled_ && !exact_range && page_last - page_first <= 1;
++  if (volatile_write_fault) {
++    volatile_faults_.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t now_ms = VolatileNowMs();
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      VolatilePage& info = volatile_pages_[page];
++      info.faults = (info.faults && now_ms - info.fault_ms <= kVolatileFaultGapMs)
++                        ? uint8_t(std::min<uint32_t>(info.faults + 1u, 255u))
++                        : uint8_t(1);
++      info.fault_ms = now_ms;
++      if (info.faults >= kVolatileFaultCount || info.sticky) {
++        MakePageVolatile(page);
++      }
++    }
++  } else if (volatile_pages_enabled_ && exact_range &&
++             volatile_page_count_.load(std::memory_order_relaxed)) {
++    // Memory freed, allocated or reprotected: what was in it is gone.
++    for (uint32_t i = block_first; i <= block_last; ++i) {
++      uint64_t bits = system_page_flags_volatile_[i].load(std::memory_order_relaxed);
++      if (i == block_first) {
++        bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
++      }
++      if (i == block_last && (page_last & 63) != 63) {
++        bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++      }
++      uint32_t bit_index;
++      while (rex::bit_scan_forward(bits, &bit_index)) {
++        bits &= ~(uint64_t(1) << bit_index);
++        ClearPageVolatile((i << 6) + bit_index);
++      }
++    }
++  }
++
+   if (!exact_range) {
+     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+     // invalidated - if no GPU-written data nearby that was not intended to be
+@@ -516,6 +773,17 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     }
+   }
+ 
++  // [ps5 port] The pages around it that are unprotected along with it: the
++  // ones that have been volatile before are again, without waiting for a
++  // fault of their own (which protecting them again would only lead to).
++  if (volatile_write_fault) {
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      if (volatile_pages_[page].sticky) {
++        MakePageVolatile(page);
++      }
++    }
++  }
++
+   for (uint32_t i = block_first; i <= block_last; ++i) {
+     uint64_t invalidate_bits = UINT64_MAX;
+     if (i == block_first) {
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 6207c1c6..f53c24eb 100644
+index 6207c1c6..47ad65d5 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -3150,13 +4189,649 @@ index 6207c1c6..f53c24eb 100644
  #include <algorithm>
  #include <array>
  #include <chrono>
-@@ -2276,6 +2277,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -25,6 +26,7 @@
+ #include <SPIRV/GlslangToSpv.h>
+ #include <glslang/Public/ShaderLang.h>
+ #include <rex/assert.h>
++#include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -1893,6 +1895,7 @@ bool VulkanCommandProcessor::SetupContext() {
+   }
+ 
+   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
++  InitializeGpuTimestamps();
+ 
+   // Just not to expose uninitialized memory.
+   std::memset(&system_constants_, 0, sizeof(system_constants_));
+@@ -1904,6 +1907,7 @@ void VulkanCommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
++  ShutdownGpuTimestamps();
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -2276,6 +2280,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
  void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                         uint32_t frontbuffer_height) {
    SCOPE_profile_cpu_f("gpu");
 +  rex::ps5diag::Add(rex::ps5diag::kSwaps);
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -2292,6 +2297,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
+     return;
+   }
++  GpuPhaseScope gpu_phase(*this, GpuPhase::kSwap);
+ 
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+@@ -3644,6 +3650,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
++  if (gpu_phase_timing_) {
++    ++gpu_phase_draws_by_msaa_[std::min<size_t>(
++        size_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples), 2)];
++  }
+ 
+   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
+ 
+@@ -4181,6 +4191,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                               0, 0, 0);
+   }
+ 
++  // [ps5 port] The GPU time of this draw, while profiling (MarkGpuDraw).
++  if (gpu_phase_timing_) {
++    GpuDrawKind kind;
++    std::memset(&kind, 0, sizeof(kind));
++    kind.vertex_shader_hash = vertex_shader->ucode_data_hash();
++    kind.pixel_shader_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
++    const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++    kind.msaa_samples = uint32_t(surface_info.msaa_samples);
++    kind.surface_pitch = surface_info.surface_pitch;
++    kind.color_format = uint32_t(
++        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format);
++    kind.color_mask = normalized_color_mask;
++    MarkGpuDraw(kind);
++  }
++
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+@@ -4416,6 +4441,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  GpuPhaseScope gpu_phase(*this, GpuPhase::kResolve);
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+@@ -4757,6 +4783,339 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
+   }
+ }
+ 
++void VulkanCommandProcessor::InitializeGpuTimestamps() {
++  gpu_timestamp_pool_ = VK_NULL_HANDLE;
++  gpu_timestamp_slot_submission_.fill(0);
++  gpu_timestamp_last_end_ = 0;
++  gpu_busy_ns_unreported_ = 0.0;
++#if REX_PLATFORM_PS5
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const auto& ifn = vulkan_device->vulkan_instance()->functions();
++  VkDevice device = vulkan_device->device();
++
++  VkPhysicalDeviceProperties properties;
++  ifn.vkGetPhysicalDeviceProperties(vulkan_device->physical_device(), &properties);
++  uint32_t family_count = 0;
++  ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(), &family_count,
++                                               nullptr);
++  std::vector<VkQueueFamilyProperties> families(family_count);
++  ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(), &family_count,
++                                               families.data());
++  const uint32_t family = vulkan_device->queue_family_graphics_compute();
++  const uint32_t valid_bits = family < family_count ? families[family].timestampValidBits : 0;
++  if (!valid_bits || !(properties.limits.timestampPeriod > 0.0f)) {
++    REXGPU_INFO("GPU time isn't measured: no timestamps on the graphics queue");
++    return;
++  }
++  VkQueryPoolCreateInfo pool_info = {};
++  pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++  pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++  pool_info.queryCount = kGpuTimestampSlots * 2;
++  if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_timestamp_pool_) != VK_SUCCESS) {
++    gpu_timestamp_pool_ = VK_NULL_HANDLE;
++    REXGPU_WARN("GPU time isn't measured: no timestamp query pool");
++    return;
++  }
++  gpu_timestamp_ns_per_tick_ = double(properties.limits.timestampPeriod);
++  gpu_timestamp_mask_ = valid_bits >= 64 ? UINT64_MAX : (uint64_t(1) << valid_bits) - 1;
++  gpu_timestamp_one_second_ = uint64_t(1e9 / gpu_timestamp_ns_per_tick_);
++  REXGPU_INFO("GPU time is measured ({} ns a tick, {} bits)", gpu_timestamp_ns_per_tick_,
++              valid_bits);
++  // (what the time goes to, while the profiler runs)
++  pool_info.queryCount = kGpuPhaseSlots * kGpuPhaseQueriesPerSlot;
++  if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_phase_pool_) != VK_SUCCESS) {
++    gpu_phase_pool_ = VK_NULL_HANDLE;
++  }
++  gpu_phase_slot_submission_.fill(0);
++#endif
++}
++
++void VulkanCommandProcessor::ShutdownGpuTimestamps() {
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
++    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), gpu_timestamp_pool_,
++                                                  nullptr);
++  }
++  if (gpu_phase_pool_ != VK_NULL_HANDLE) {
++    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), gpu_phase_pool_,
++                                                  nullptr);
++  }
++  gpu_timestamp_pool_ = VK_NULL_HANDLE;
++  gpu_phase_pool_ = VK_NULL_HANDLE;
++  gpu_timestamp_slot_submission_.fill(0);
++  gpu_phase_slot_submission_.fill(0);
++  gpu_phase_timing_ = false;
++}
++
++void VulkanCommandProcessor::BeginGpuPhaseTiming() {
++  gpu_phase_timing_ = false;
++  if (gpu_phase_pool_ == VK_NULL_HANDLE || !rex::ps5diag::ProfilerRunning()) {
++    return;
++  }
++  const uint64_t submission = GetCurrentSubmission();
++  const uint32_t slot = uint32_t(submission % kGpuPhaseSlots);
++  if (gpu_phase_slot_submission_[slot]) {
++    return;  // (an earlier submission's, not read yet)
++  }
++  gpu_phase_timing_ = true;
++  gpu_phase_slot_ = slot;
++  gpu_phase_query_count_ = 1;  // (query 0: written when the submission starts)
++  std::vector<GpuInterval>& intervals = gpu_phase_slot_intervals_[slot];
++  intervals.clear();
++  intervals.push_back({gpu_phase_, kNoDrawKind});
++}
++
++void VulkanCommandProcessor::MarkGpuDraw(const GpuDrawKind& kind) {
++  if (!gpu_phase_timing_ || !submission_open_ ||
++      gpu_phase_query_count_ + 1 >= kGpuPhaseQueriesPerSlot) {
++    return;
++  }
++  auto id_it = gpu_draw_kind_ids_.find(kind);
++  uint32_t id;
++  if (id_it != gpu_draw_kind_ids_.end()) {
++    id = id_it->second;
++  } else {
++    id = uint32_t(gpu_draw_kinds_.size());
++    gpu_draw_kind_ids_.emplace(kind, id);
++    gpu_draw_kinds_.push_back(kind);
++    gpu_draw_kind_ns_.push_back(0.0);
++    gpu_draw_kind_count_.push_back(0);
++  }
++  std::vector<GpuInterval>& intervals = gpu_phase_slot_intervals_[gpu_phase_slot_];
++  intervals.back().draw_kind = id;
++  deferred_command_buffer_.CmdVkWriteTimestamp(
++      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_phase_pool_,
++      gpu_phase_slot_ * kGpuPhaseQueriesPerSlot + gpu_phase_query_count_);
++  ++gpu_phase_query_count_;
++  intervals.push_back({gpu_phase_, kNoDrawKind});
++}
++
++void VulkanCommandProcessor::NoteGpuTransfer(uint32_t source_key, uint32_t dest_key,
++                                             uint32_t tiles, bool skipped) {
++  GpuTransferStats& stats = gpu_transfer_stats_[(uint64_t(source_key) << 32) | dest_key];
++  ++stats.count;
++  stats.tiles += tiles;
++  stats.skipped += skipped ? 1 : 0;
++}
++
++void VulkanCommandProcessor::SetGpuPhase(GpuPhase phase) {
++  if (phase == gpu_phase_) {
++    return;
++  }
++  gpu_phase_ = phase;
++  // (one query is kept for the end of the submission)
++  if (!gpu_phase_timing_ || !submission_open_ ||
++      gpu_phase_query_count_ + 1 >= kGpuPhaseQueriesPerSlot) {
++    return;
++  }
++  deferred_command_buffer_.CmdVkWriteTimestamp(
++      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_phase_pool_,
++      gpu_phase_slot_ * kGpuPhaseQueriesPerSlot + gpu_phase_query_count_);
++  ++gpu_phase_query_count_;
++  gpu_phase_slot_intervals_[gpu_phase_slot_].push_back({phase, kNoDrawKind});
++  ++gpu_phase_entries_[size_t(phase)];
++}
++
++void VulkanCommandProcessor::ReadGpuPhases(uint64_t first_submission, uint64_t last_submission) {
++  if (gpu_phase_pool_ == VK_NULL_HANDLE) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  bool any = false;
++  std::vector<uint64_t> ticks;
++  for (uint64_t submission = first_submission; submission <= last_submission; ++submission) {
++    const uint32_t slot = uint32_t(submission % kGpuPhaseSlots);
++    if (gpu_phase_slot_submission_[slot] != submission) {
++      continue;
++    }
++    gpu_phase_slot_submission_[slot] = 0;
++    const std::vector<GpuInterval>& intervals = gpu_phase_slot_intervals_[slot];
++    const uint32_t query_count = uint32_t(intervals.size()) + 1;
++    ticks.resize(query_count);
++    if (vulkan_device->functions().vkGetQueryPoolResults(
++            vulkan_device->device(), gpu_phase_pool_, slot * kGpuPhaseQueriesPerSlot,
++            query_count, sizeof(uint64_t) * query_count, ticks.data(), sizeof(uint64_t),
++            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++      continue;
++    }
++    for (size_t i = 0; i < intervals.size(); ++i) {
++      const uint64_t from = ticks[i] & gpu_timestamp_mask_;
++      const uint64_t to = ticks[i + 1] & gpu_timestamp_mask_;
++      if (to < from || to - from > gpu_timestamp_one_second_) {
++        continue;
++      }
++      const double ns = double(to - from) * gpu_timestamp_ns_per_tick_;
++      const GpuInterval& interval = intervals[i];
++      if (interval.draw_kind == kNoDrawKind) {
++        gpu_phase_ns_[size_t(interval.phase)] += ns;
++        continue;
++      }
++      gpu_draw_kind_ns_[interval.draw_kind] += ns;
++      ++gpu_draw_kind_count_[interval.draw_kind];
++      gpu_draw_ns_ += ns;
++      ++gpu_draw_count_;
++      const size_t bucket = ns < 10e3 ? 0 : ns < 50e3 ? 1 : ns < 200e3 ? 2 : ns < 1000e3 ? 3 : 4;
++      gpu_draw_bucket_ns_[bucket] += ns;
++      ++gpu_draw_bucket_count_[bucket];
++    }
++    any = true;
++  }
++  if (any) {
++    ReportGpuPhases();
++  }
++}
++
++void VulkanCommandProcessor::ReportGpuPhases() {
++#if REX_PLATFORM_PS5
++  const uint64_t now_ms = rex::ps5diag::NowMs();
++  if (!gpu_phase_report_ms_) {
++    gpu_phase_report_ms_ = now_ms;
++    gpu_phase_report_swaps_ = rex::ps5diag::Get(rex::ps5diag::kSwaps);
++    return;
++  }
++  if (now_ms - gpu_phase_report_ms_ < 30000) {
++    return;
++  }
++  const uint64_t swaps = rex::ps5diag::Get(rex::ps5diag::kSwaps);
++  const double frames = double(std::max<uint64_t>(swaps - gpu_phase_report_swaps_, 1));
++  const double seconds = double(now_ms - gpu_phase_report_ms_) / 1000.0;
++  auto ms = [&](GpuPhase phase) { return gpu_phase_ns_[size_t(phase)] / 1e6 / frames; };
++  auto per_frame = [&](GpuPhase phase) { return double(gpu_phase_entries_[size_t(phase)]) / frames; };
++  const double msaa_draws = double(std::max<uint64_t>(
++      gpu_phase_draws_by_msaa_[0] + gpu_phase_draws_by_msaa_[1] + gpu_phase_draws_by_msaa_[2], 1));
++  REXGPU_INFO(
++      "ps5 gpu: {:.1f} s, {:.1f} frames/s. A frame's GPU time: draws {:.1f} ms ({:.0f} a frame), "
++      "between draws {:.1f} ms, EDRAM transfers {:.1f} ms ({:.0f} a frame), resolves {:.1f} ms "
++      "({:.0f} a frame), texture loads {:.1f} ms ({:.0f} a frame), uploads {:.1f} ms ({:.0f} a "
++      "frame), frame out {:.1f} ms. Draws by MSAA: 1x {:.0f}%, 2x {:.0f}%, 4x {:.0f}%",
++      seconds, frames / seconds, gpu_draw_ns_ / 1e6 / frames, double(gpu_draw_count_) / frames,
++      ms(GpuPhase::kDraw), ms(GpuPhase::kTransfer), per_frame(GpuPhase::kTransfer),
++      ms(GpuPhase::kResolve), per_frame(GpuPhase::kResolve), ms(GpuPhase::kTextureLoad),
++      per_frame(GpuPhase::kTextureLoad), ms(GpuPhase::kUpload), per_frame(GpuPhase::kUpload),
++      ms(GpuPhase::kSwap), 100.0 * double(gpu_phase_draws_by_msaa_[0]) / msaa_draws,
++      100.0 * double(gpu_phase_draws_by_msaa_[1]) / msaa_draws,
++      100.0 * double(gpu_phase_draws_by_msaa_[2]) / msaa_draws);
++  // How long one draw took, in groups: many small ones or a few big ones.
++  REXGPU_INFO(
++      "ps5 gpu draws by time, a frame: under 10 us {:.0f} ({:.1f} ms), 10-50 us {:.0f} ({:.1f} ms), "
++      "50-200 us {:.0f} ({:.1f} ms), 0.2-1 ms {:.0f} ({:.1f} ms), over 1 ms {:.0f} ({:.1f} ms)",
++      double(gpu_draw_bucket_count_[0]) / frames, gpu_draw_bucket_ns_[0] / 1e6 / frames,
++      double(gpu_draw_bucket_count_[1]) / frames, gpu_draw_bucket_ns_[1] / 1e6 / frames,
++      double(gpu_draw_bucket_count_[2]) / frames, gpu_draw_bucket_ns_[2] / 1e6 / frames,
++      double(gpu_draw_bucket_count_[3]) / frames, gpu_draw_bucket_ns_[3] / 1e6 / frames,
++      double(gpu_draw_bucket_count_[4]) / frames, gpu_draw_bucket_ns_[4] / 1e6 / frames);
++  // The kinds of draw that took the most.
++  std::vector<uint32_t> order;
++  for (uint32_t id = 0; id < uint32_t(gpu_draw_kinds_.size()); ++id) {
++    if (gpu_draw_kind_count_[id]) {
++      order.push_back(id);
++    }
++  }
++  const size_t top = std::min<size_t>(order.size(), 12);
++  std::partial_sort(order.begin(), order.begin() + std::ptrdiff_t(top), order.end(),
++                    [this](uint32_t a, uint32_t b) {
++                      return gpu_draw_kind_ns_[a] > gpu_draw_kind_ns_[b];
++                    });
++  for (size_t i = 0; i < top; ++i) {
++    const uint32_t id = order[i];
++    const GpuDrawKind& kind = gpu_draw_kinds_[id];
++    const double count = double(gpu_draw_kind_count_[id]);
++    REXGPU_INFO(
++        "ps5 gpu top {}: {:.2f} ms a frame, {:.1f} draws a frame of {:.1f} us; vs {:016X} ps "
++        "{:016X}, MSAA {}x, RT0 {}, pitch {}, color mask {:04X}",
++        i + 1, gpu_draw_kind_ns_[id] / 1e6 / frames, count / frames,
++        gpu_draw_kind_ns_[id] / 1e3 / count, kind.vertex_shader_hash, kind.pixel_shader_hash,
++        1u << kind.msaa_samples,
++        xenos::GetColorRenderTargetFormatName(xenos::ColorRenderTargetFormat(kind.color_format)),
++        kind.surface_pitch, kind.color_mask);
++  }
++  // The EDRAM transfers by what they copy from and to, the most tiles first.
++  {
++    std::vector<std::pair<uint64_t, GpuTransferStats>> transfers(gpu_transfer_stats_.begin(),
++                                                                 gpu_transfer_stats_.end());
++    uint64_t total_tiles = 0;
++    for (const auto& transfer : transfers) {
++      total_tiles += transfer.second.tiles;
++    }
++    const size_t transfer_top = std::min<size_t>(transfers.size(), 10);
++    std::partial_sort(transfers.begin(), transfers.begin() + std::ptrdiff_t(transfer_top),
++                      transfers.end(), [](const auto& a, const auto& b) {
++                        return a.second.tiles > b.second.tiles;
++                      });
++    for (size_t i = 0; i < transfer_top; ++i) {
++      const GpuTransferStats& stats = transfers[i].second;
++      REXGPU_INFO(
++          "ps5 gpu transfer {}: {:.1f} a frame ({:.0f}% of the tiles copied{}), from {} to {}", i + 1,
++          double(stats.count) / frames,
++          total_tiles ? 100.0 * double(stats.tiles) / double(total_tiles) : 0.0,
++          stats.skipped ? fmt::format(", {} skipped", stats.skipped) : std::string(),
++          VulkanRenderTargetCache::DescribeKeyForLog(uint32_t(transfers[i].first >> 32)),
++          VulkanRenderTargetCache::DescribeKeyForLog(uint32_t(transfers[i].first)));
++    }
++    gpu_transfer_stats_.clear();
++  }
++  gpu_phase_ns_.fill(0.0);
++  gpu_phase_entries_.fill(0);
++  gpu_phase_draws_by_msaa_.fill(0);
++  std::fill(gpu_draw_kind_ns_.begin(), gpu_draw_kind_ns_.end(), 0.0);
++  std::fill(gpu_draw_kind_count_.begin(), gpu_draw_kind_count_.end(), 0);
++  gpu_draw_bucket_ns_.fill(0.0);
++  gpu_draw_bucket_count_.fill(0);
++  gpu_draw_ns_ = 0.0;
++  gpu_draw_count_ = 0;
++  gpu_phase_report_ms_ = now_ms;
++  gpu_phase_report_swaps_ = swaps;
++#endif
++}
++
++void VulkanCommandProcessor::ReadGpuTimestamps(uint64_t first_submission,
++                                               uint64_t last_submission) {
++  if (gpu_timestamp_pool_ == VK_NULL_HANDLE) {
++    return;
++  }
++  VkDevice device = GetVulkanDevice()->device();
++  uint64_t busy_ticks = 0;
++  for (uint64_t submission = first_submission; submission <= last_submission; ++submission) {
++    const uint32_t slot = uint32_t(submission % kGpuTimestampSlots);
++    if (gpu_timestamp_slot_submission_[slot] != submission) {
++      continue;
++    }
++    gpu_timestamp_slot_submission_[slot] = 0;
++    uint64_t ticks[2];
++    // (its fence is signalled: the results are there, no waiting)
++    if (GetVulkanDevice()->functions().vkGetQueryPoolResults(
++            device, gpu_timestamp_pool_, slot * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t),
++            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++      continue;
++    }
++    uint64_t start = ticks[0] & gpu_timestamp_mask_;
++    const uint64_t end = ticks[1] & gpu_timestamp_mask_;
++    if (end < start || end - start > gpu_timestamp_one_second_) {
++      continue;  // (the counter wrapped, or nonsense)
++    }
++    // A submission that began before the last one ended: counted from there.
++    if (gpu_timestamp_last_end_ > start &&
++        gpu_timestamp_last_end_ - start < gpu_timestamp_one_second_) {
++      start = std::min(gpu_timestamp_last_end_, end);
++    }
++    busy_ticks += end - start;
++    if (end > gpu_timestamp_last_end_ ||
++        gpu_timestamp_last_end_ - end >= gpu_timestamp_one_second_) {
++      gpu_timestamp_last_end_ = end;
++    }
++  }
++  if (!busy_ticks) {
++    return;
++  }
++  gpu_busy_ns_unreported_ += double(busy_ticks) * gpu_timestamp_ns_per_tick_;
++  const uint64_t busy_us = uint64_t(gpu_busy_ns_unreported_ / 1000.0);
++  if (busy_us) {
++    rex::ps5diag::AddN(rex::ps5diag::kGpuBusyUs, busy_us);
++    gpu_busy_ns_unreported_ -= double(busy_us) * 1000.0;
++  }
++}
++
+ bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
+   active_occlusion_query_ = {};
+   occlusion_query_cursor_ = 0;
+@@ -4997,9 +5356,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++    // [ps5 port] (the time the GPU keeps the command processor waiting:
++    // rex::ps5diag::kGpuWaitUs, the log's "waited on gpu")
++    const uint64_t wait_start_ticks = rex::chrono::Clock::QueryHostTickCount();
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++    const uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
++    if (tick_frequency) {
++      rex::ps5diag::AddN(rex::ps5diag::kGpuWaitUs,
++                         (rex::chrono::Clock::QueryHostTickCount() - wait_start_ticks) * 1000000 /
++                             tick_frequency);
++    }
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5041,6 +5409,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+                       submissions_in_flight_fences_awaited_end);
+   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
+                                       submissions_in_flight_fences_awaited_end);
++  ReadGpuTimestamps(submission_completed_ + 1, submission_completed_ + fences_awaited);
++  ReadGpuPhases(submission_completed_ + 1, submission_completed_ + fences_awaited);
+   submission_completed_ += fences_awaited;
+ 
+   // Reclaim semaphores.
+@@ -5163,6 +5533,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     // the end of the submission (when async pipeline object creation requests
+     // are fulfilled).
+     deferred_command_buffer_.Reset();
++    BeginGpuPhaseTiming();
+ 
+     // Reset cached state of the command buffer.
+     dynamic_viewport_update_needed_ = true;
+@@ -5412,7 +5783,37 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+       return false;
+     }
++    // [ps5 port] The GPU time of the submission (gpu_timestamp_pool_), in a
++    // slot whose earlier submission has been read.
++    const uint64_t timestamp_submission = GetCurrentSubmission();
++    const uint32_t timestamp_slot = uint32_t(timestamp_submission % kGpuTimestampSlots);
++    const bool timestamped = gpu_timestamp_pool_ != VK_NULL_HANDLE &&
++                             gpu_timestamp_slot_submission_[timestamp_slot] == 0;
++    if (timestamped) {
++      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_timestamp_pool_, timestamp_slot * 2, 2);
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              gpu_timestamp_pool_, timestamp_slot * 2);
++    }
++    // (the queries of the kinds of work: reset before the deferred commands
++    // write them, the first at the start, the last at the end)
++    const uint32_t phase_first_query = gpu_phase_slot_ * kGpuPhaseQueriesPerSlot;
++    if (gpu_phase_timing_) {
++      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_phase_pool_, phase_first_query,
++                              gpu_phase_query_count_ + 1);
++      // (bottom of the pipe: when the submissions before it are done, so their
++      // work isn't counted in this one's first interval)
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              gpu_phase_pool_, phase_first_query);
++    }
+     deferred_command_buffer_.Execute(command_buffer.buffer);
++    if (gpu_phase_timing_) {
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              gpu_phase_pool_, phase_first_query + gpu_phase_query_count_);
++    }
++    if (timestamped) {
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              gpu_timestamp_pool_, timestamp_slot * 2 + 1);
++    }
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to end a Vulkan command buffer");
+       return false;
+@@ -5457,6 +5858,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       return false;
+     }
+     uint64_t submission_current = GetCurrentSubmission();
++    if (timestamped) {
++      gpu_timestamp_slot_submission_[timestamp_slot] = submission_current;
++    }
++    if (gpu_phase_timing_) {
++      gpu_phase_slot_submission_[gpu_phase_slot_] = submission_current;
++      gpu_phase_timing_ = false;
++    }
+     current_submission_wait_stage_masks_.clear();
+     for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
+       submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033b..51215f22 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -314,6 +314,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
+       } break;
+ 
++      case Command::kVkWriteTimestamp: {
++        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
++        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool, args.query);
++      } break;
++
+       default:
+         assert_unhandled_case(header.command);
+         break;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f062..7f106fde 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -41,6 +41,15 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// [ps5 port] For finding out which EDRAM transfers a game needs: "all" (the
++// default) does them all; "none" skips every one; "color" or "depth" does only
++// the ones into render targets of that kind. Skipping one leaves the
++// destination with what it held before instead of what the other render
++// target wrote over that EDRAM: faster, and wrong where the game reads it.
++REXCVAR_DEFINE_STRING(ps5_edram_transfers, "all", "PS5",
++                      "EDRAM transfers between render targets: all, none, color or depth")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ // DEFINE_string(
+ //     render_target_path_vulkan, "",
+ //     "Render target emulation path to use on Vulkan.\n"
+@@ -180,6 +189,17 @@ const VulkanRenderTargetCache::TransferModeInfo
+         {TransferOutput::kDepth, TransferPipelineLayoutIndex::kDepthAndHostDepthBuffer},
+ };
+ 
++std::string VulkanRenderTargetCache::DescribeKeyForLog(uint32_t key_value) {
++  RenderTargetKey key;
++  key.key = key_value;
++  const char* format = key.is_depth
++                           ? xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat())
++                           : xenos::GetColorRenderTargetFormatName(key.GetColorFormat());
++  return fmt::format("{} {} at tile {}, pitch {} tiles, MSAA {}x",
++                     key.is_depth ? "depth" : "color", format, uint32_t(key.base_tiles),
++                     uint32_t(key.pitch_tiles_at_32bpp), 1u << uint32_t(key.msaa_samples));
++}
++
+ VulkanRenderTargetCache::VulkanRenderTargetCache(const RegisterFile& register_file,
+                                                  const memory::Memory& memory,
+                                                  uint32_t draw_resolution_scale_x,
+@@ -1397,8 +1417,52 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
+ 
+-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+-                                       depth_and_color_render_targets, last_update_transfers());
++      {
++        // (timed as transfers only when there are any: an empty one is no
++        // work, and its two queries were two of a draw's)
++        const std::vector<Transfer>* transfers = last_update_transfers();
++        bool any_transfers = false;
++        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++          any_transfers |= !transfers[i].empty();
++        }
++        // [ps5 port] Which to skip (ps5_edram_transfers), and what they were
++        // for the profiling report.
++        static const std::string transfers_setting = REXCVAR_GET(ps5_edram_transfers);
++        static const bool keep_color = transfers_setting != "none" && transfers_setting != "depth";
++        static const bool keep_depth = transfers_setting != "none" && transfers_setting != "color";
++        std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> kept_transfers;
++        if (any_transfers && (!keep_color || !keep_depth || command_processor_.gpu_phase_timing())) {
++          any_transfers = false;
++          for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++            RenderTarget* dest = depth_and_color_render_targets[i];
++            if (!dest || transfers[i].empty()) {
++              continue;
++            }
++            const bool keep = dest->key().is_depth ? keep_depth : keep_color;
++            for (const Transfer& transfer : transfers[i]) {
++              if (command_processor_.gpu_phase_timing() && transfer.source) {
++                command_processor_.NoteGpuTransfer(transfer.source->key().key, dest->key().key,
++                                                   transfer.end_tiles - transfer.start_tiles,
++                                                   !keep);
++              }
++            }
++            if (keep) {
++              kept_transfers[i] = transfers[i];
++              any_transfers = true;
++            }
++          }
++          transfers = kept_transfers.data();
++        }
++        if (any_transfers) {
++          VulkanCommandProcessor::GpuPhaseScope gpu_phase(
++              command_processor_, VulkanCommandProcessor::GpuPhase::kTransfer);
++          PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                           depth_and_color_render_targets, transfers);
++        } else {
++          PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                           depth_and_color_render_targets, transfers);
++        }
++      }
+ 
+       if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 962ba33e..58802ded 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -273,6 +273,8 @@ bool VulkanSharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  VulkanCommandProcessor::GpuPhaseScope gpu_phase(command_processor_,
++                                                 VulkanCommandProcessor::GpuPhase::kUpload);
+   // upload_page_ranges are sorted, use them to determine the range for the
+   // ordering barrier.
+   Use(Usage::kTransferDestination,
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940d..a45141f9 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1215,6 +1215,8 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+ 
+ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                                bool load_mips) {
++  VulkanCommandProcessor::GpuPhaseScope gpu_phase(command_processor_,
++                                                 VulkanCommandProcessor::GpuPhase::kTextureLoad);
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
  
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
 index 3ea35358..ecc92087 100644
@@ -4348,7 +6023,7 @@ index dc0b4c2e..45e6d3e4 100644
    if (!requested_driver.empty()) {
      SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 77bb1dc2..006bb8f8 100644
+index 77bb1dc2..1774e0d9 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
 @@ -67,6 +67,12 @@ int RunWindowedApp(int argc, char** argv) {
@@ -4364,7 +6039,7 @@ index 77bb1dc2..006bb8f8 100644
  
      app->InvokeOnDestroy();
    }
-@@ -124,6 +130,138 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+@@ -124,6 +130,149 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
    return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
  }
  
@@ -4430,6 +6105,7 @@ index 77bb1dc2..006bb8f8 100644
 +void Ps5DiagMonitor() {
 +  using namespace rex::ps5diag;
 +  uint64_t last_swaps = 0, stuck_ticks = 0, samples = 0;
++  uint64_t last_ms = NowMs(), last_gpu_busy_us = 0, last_gpu_wait_us = 0;
 +  for (int tick = 1;; ++tick) {
 +    // A thread crashed: the crash hook ends the game; if it hangs (flushing
 +    // the log behind a lock the crashed thread holds), this does.
@@ -4441,12 +6117,22 @@ index 77bb1dc2..006bb8f8 100644
 +    }
 +    if (crashed_at_ms.load(std::memory_order_acquire) || !REXCVAR_GET(ps5_diag_monitor)) continue;
 +    const uint64_t swaps = Get(kSwaps);
++    // How much of the time the GPU was working on the game's frames, and how
++    // much of it the command processor sat waiting for the GPU to catch up:
++    // near 100% and well above 0, the GPU is what limits the frame rate.
++    const uint64_t now_ms = NowMs(), gpu_busy_us = Get(kGpuBusyUs), gpu_wait_us = Get(kGpuWaitUs);
++    const double span_us = double(std::max<uint64_t>(now_ms - last_ms, 1)) * 1000.0;
 +    REXLOG_INFO(
-+        "ps5 diag {}s: frames {} ({:.1f}/s), faults {} (mmio {}, watch {}, unhandled {}), vblanks {}, "
-+        "interrupts {}, ring writes {}, ring batches {}",
-+        tick * 10, swaps, double(swaps - last_swaps) / 10.0, Get(kAccessViolations), Get(kMmioAccesses),
-+        Get(kWatchFaults), Get(kUnhandledFaults), Get(kVblanks), Get(kInterrupts), Get(kWritePointer),
-+        Get(kPrimaryBuffers));
++        "ps5 diag {}s: frames {} ({:.1f}/s), gpu busy {:.0f}%, waited on gpu {:.0f}%, faults {} "
++        "(mmio {}, watch {}, unhandled {}), vblanks {}, interrupts {}, ring writes {}, ring batches {}",
++        tick * 10, swaps, double(swaps - last_swaps) / 10.0,
++        100.0 * double(gpu_busy_us - last_gpu_busy_us) / span_us,
++        100.0 * double(gpu_wait_us - last_gpu_wait_us) / span_us, Get(kAccessViolations),
++        Get(kMmioAccesses), Get(kWatchFaults), Get(kUnhandledFaults), Get(kVblanks), Get(kInterrupts),
++        Get(kWritePointer), Get(kPrimaryBuffers));
++    last_ms = now_ms;
++    last_gpu_busy_us = gpu_busy_us;
++    last_gpu_wait_us = gpu_wait_us;
 +    // The game stopped presenting frames for 30 s: where every thread is
 +    // (twice at most, 30 s apart, so the log stays readable).
 +    stuck_ticks = swaps == last_swaps ? stuck_ticks + 1 : 0;

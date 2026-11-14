@@ -8,22 +8,73 @@
 # have English and French voices, and Spanish text with English voices.
 #ps5_language = "auto"          # auto, english, french, spanish
 
-# The TV mode the picture is sent in: 2160 (4K) or 1080. The game itself is
-# drawn at the Xbox 360's 1280x720 and scaled up to it.
+# Frames a second the game aims for: 60, or 30, the game as it shipped on the
+# Xbox 360. Set 30 if something looks or plays wrong at 60.
+#ps5_frame_rate = 60
+
+# At 60, some cutscene animation isn't quite right (as in the PC release), so
+# the game goes back to its own 30 while a cutscene has hold of Isaac, and to
+# 60 when it is over. false: 60 in cutscenes too.
+#ps5_cutscenes_30 = true
+
+# Adaptive vsync: a frame that is a little late is shown as soon as it is
+# ready. false is the Xbox 360's way: it waits for the next refresh, so a
+# frame that takes 17 ms is shown after 33 and 60 frames a second become 30.
+# Set false if the game's speed or its motion seems wrong.
+#vsync_adaptive = true
+
+# Faster tracking of the graphics data the game rewrites every frame (moving
+# characters, effects). New and untested: set false if geometry flickers,
+# stretches or is left behind where it was a moment ago.
+#shared_memory_volatile_pages = true
+
+# A frames-a-second counter in the top right corner of the picture.
+#ps5_show_fps = false
+
+# The TV mode the picture is sent in: 2160 (4K), 1440 or 1080. The picture
+# the game draws (resolution_scale, below) is scaled to it.
 #ps5_display_height = 2160
 
-# Draw the game at 2 or 3 times the Xbox 360's resolution (2 = 2560x1440,
-# 3 = 3840x2160). Untested on the PS5: it costs graphics memory and speed, and
-# some effects may look different. 1 is the console's own.
+# The resolution the game is drawn at, in times the Xbox 360's 1280x720:
+# 1 = 1280x720, 2 = 2560x1440, 3 = 3840x2160 (native 4K). Each step is a lot
+# more work for the graphics chip (2 is four times the pixels of 1, 3 is nine
+# times). If the frame rate dips, the log's "gpu busy" says whether this is
+# why: near 100%, the graphics chip is the limit.
 #resolution_scale = 1
 
 # Sound queued ahead of the speakers, in 5.3 ms frames (4 to 64). Fewer is
 # less delay between picture and sound, but may crackle.
 #audio_maxqframes = 8
 
+# The progress screen of the first start, while the game's files are prepared
+# (unpacking Severed takes a few minutes). false: no screen, only a PS5
+# notification; try it if the app stays black and never reaches the game.
+#ps5_prepare_screen = true
+
 # The log (in the app's logs folder): info, debug or trace say more.
 #log_level = "info"
 
-# Every 10 s, a line of progress counters in the log, and where every thread
-# is when the game stops drawing. Leave on while the port is young.
+# Experiment, for performance work: the copies the emulator makes when the
+# game switches the Xbox 360's EDRAM from one surface to another ("EDRAM
+# transfers" in the profile). "all" makes every one, as it should; "none"
+# skips them all, which is faster and will show wrong pictures where the game
+# needs a copy; "color" or "depth" makes only those of that kind.
+#ps5_edram_transfers = "all"
+
+# For the native renderer's work: 1 records the game's Direct3D calls. Every
+# 30 s a line in the log, every 60 s one whole frame call by call in the logs
+# folder (d3d_frame_<n>.txt), and each shader the game creates
+# (d3d_shaders.txt). A little slower while a frame is recorded.
+#ps5_d3d_trace = 0
+
+# For performance work only, when a log is being recorded to find out what
+# limits the frame rate: every 30 s the log gets, for each busy thread, how
+# much of a processor core it used and where it spent the time. To find that
+# out it stops every thread 100 times a second to see what it is doing, and
+# that slows the game a little (a few percent). Leave it off to play.
+#ps5_profile = false
+
+# Every 10 s, a line in the log with the frame rate, how busy the graphics
+# chip was, and other progress counters; and where every thread is when the
+# game stops drawing. Costs next to nothing; leave on while the port is young.
 #ps5_diag_monitor = true
