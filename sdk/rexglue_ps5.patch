@@ -345,7 +345,7 @@ index 00000000..87e2fd2e
 +
 +#endif  // !_WIN32
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
-index ac6b056e..5077020f 100644
+index ac6b056e..9fab334f 100644
 --- a/include/rex/graphics/graphics_system.h
 +++ b/include/rex/graphics/graphics_system.h
 @@ -14,6 +14,8 @@
@@ -384,7 +384,7 @@ index ac6b056e..5077020f 100644
    virtual void ClearCaches();
    virtual void InvalidateGpuMemory();
  
-@@ -120,6 +142,14 @@ class GraphicsSystem : public system::IGraphicsSystem {
+@@ -120,6 +142,20 @@ class GraphicsSystem : public system::IGraphicsSystem {
  
    std::atomic<bool> vsync_worker_running_;
    system::object_ref<system::XHostThread> vsync_worker_thread_;
@@ -394,8 +394,14 @@ index ac6b056e..5077020f 100644
 +  bool vsync_wake_requested_ = false;                      // (under vsync_mutex_)
 +  std::atomic<bool> swap_waiting_{false};
 +  std::atomic<uint64_t> swap_wait_serial_{0};              // the wait going on, or the last one
-+  std::atomic<uint64_t> vblank_serial_{0};                 // vblanks given
-+  std::atomic<uint64_t> swap_release_vblank_serial_{0};    // vblank_serial_ when the last wait ended
++  std::atomic<uint64_t> vblank_serial_{0};                 // vblanks given (handler done)
++  // Vblanks begun. A wait can end on what the game's interrupt handler did
++  // before the vblank counts as given: taking vblank_serial_ for "the vblank
++  // that let the last frame go" then named the one before, the next frame
++  // looked late, and got a vblank the moment it waited. A console ran at 61
++  // to 65 frames a second that way, the game a few percent fast.
++  std::atomic<uint64_t> vblank_begun_serial_{0};
++  std::atomic<uint64_t> swap_release_vblank_serial_{0};    // vblank_begun_serial_ when the last wait ended
  
    RegisterFile register_file_;
    std::unique_ptr<CommandProcessor> command_processor_;
@@ -3403,7 +3409,7 @@ index 2266c728..15eb5729 100644
            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
          }
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0b..9eb6ef73 100644
+index 8f2fcb0b..4423ae36 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -10,6 +10,7 @@
@@ -3448,7 +3454,7 @@ index 8f2fcb0b..9eb6ef73 100644
 +              swap_waiting_.load(std::memory_order_acquire)) {
 +            const uint64_t wait_serial = swap_wait_serial_.load(std::memory_order_acquire);
 +            if (wait_serial != early_given_for_wait &&
-+                vblank_serial_.load(std::memory_order_acquire) !=
++                vblank_begun_serial_.load(std::memory_order_acquire) !=
 +                    swap_release_vblank_serial_.load(std::memory_order_acquire)) {
 +              early_given_for_wait = wait_serial;
 +              MarkVblank();
@@ -3483,7 +3489,7 @@ index 8f2fcb0b..9eb6ef73 100644
  
    auto thread = system::XThread::GetCurrentThread();
    assert_not_null(thread);
-@@ -316,10 +355,32 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -316,10 +355,34 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                           rex::countof(args));
  }
  
@@ -3496,7 +3502,7 @@ index 8f2fcb0b..9eb6ef73 100644
 +}
 +
 +void GraphicsSystem::EndSwapWait() {
-+  swap_release_vblank_serial_.store(vblank_serial_.load(std::memory_order_acquire),
++  swap_release_vblank_serial_.store(vblank_begun_serial_.load(std::memory_order_acquire),
 +                                    std::memory_order_release);
 +  swap_waiting_.store(false, std::memory_order_release);
 +}
@@ -3513,10 +3519,12 @@ index 8f2fcb0b..9eb6ef73 100644
    // SCOPE_profile_cpu_f("gpu");
  
 +  rex::ps5diag::Add(rex::ps5diag::kVblanks);
++  // [ps5 port] (before the game's interrupt handler: see vblank_begun_serial_)
++  vblank_begun_serial_.fetch_add(1, std::memory_order_acq_rel);
    // Increment vblank counter (so the game sees us making progress).
    if (command_processor_) {
      command_processor_->increment_counter();
-@@ -329,6 +390,9 @@ void GraphicsSystem::MarkVblank() {
+@@ -329,6 +392,9 @@ void GraphicsSystem::MarkVblank() {
    //     something wrong and the CP will block waiting for code that
    //     needs to be run in the interrupt.
    DispatchInterruptCallback(0, 2);
