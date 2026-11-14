@@ -92,6 +92,15 @@
 # 26:start 30:start 34:start 38:start 42:a 50:a". Leave it empty to play.
 #ps5_input_script = ""
 
+# Experiment, at resolution_scale 2 or 3: native resolves. 1: the pictures the
+# game copies out of its render targets reach the textures that read them
+# directly, instead of through the Xbox 360's memory layout and back. 2: and
+# once only those textures read them, they aren't written to memory at all
+# (the log says so, and if anything else reads one later, it is written
+# again). 0: as the Xbox 360 does it. Say if a picture flickers, shows an
+# old frame or looks wrong somewhere with it on.
+#ps5_resolve_forward = 0
+
 # For performance work only, when a log is being recorded to find out what
 # limits the frame rate: every 30 s the log gets, for each busy thread, how
 # much of a processor core it used and where it spent the time. To find that

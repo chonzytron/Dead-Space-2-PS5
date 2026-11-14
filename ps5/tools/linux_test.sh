@@ -64,6 +64,12 @@ run)
     fi
     ln -sfn "$files" "$run_dir/install"
     [[ -f $run_dir/ds2.toml ]] || cp "$repo/ps5/package/ds2.example.toml" "$run_dir/ds2.toml"
+    # Guest memory is a file in /dev/shm, removed when the program ends; one
+    # left by a run that was killed fills it, and the next run then dies of a
+    # bus error as soon as the game touches memory that can't be backed.
+    if ! pgrep -x ds2 > /dev/null; then
+        rm -f /dev/shm/xenia_memory_*
+    fi
     echo "==> running from $run_dir (settings: $run_dir/ds2.toml, logs: $run_dir/logs)"
     cd "$run_dir"
     exec ./ds2 --user_data_root="$run_dir/UserData" "$@"

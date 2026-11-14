@@ -142,6 +142,48 @@ do differently is in render targets, resolves and the textures made from them;
 the draws, shaders, vertex and constant data and the game's own textures can be
 the emulated renderer's as they are.
 
+## Step 1: native resolves (resolve forwarding)
+
+Chosen over taking over every Direct3D call: the savings are all in render
+targets, resolves and their read-back, so those are made native inside the
+emulated renderer, and the draws stay as they are.
+
+The profiler's resolve catalogue (`ps5 gpu resolve` / `ps5 gpu resolved load`
+lines) shows what the game resolves: in the rooms seen so far, whole 1280x720
+(and 640x360) pictures at 1x, colour from a k_8_8_8_8 target to a k_8_8_8_8
+texture with red and blue swapped, depth from D24S8 to a k_24_8 texture, each
+read back once by a texture of the same address, size and format.
+
+`ps5_resolve_forward` (SDK: `VulkanTextureCache::ForwardResolve`,
+`VulkanRenderTargetCache::FindWholeForwardSource`):
+
+- **1**: at a whole colour resolve, the render target is also blitted into an
+  image of its own (an RGBA to BGRA blit does the swap); a texture that is
+  exactly that picture is filled from it by an image copy instead of being
+  untiled from memory. Memory is still written. A later write to the range
+  (another resolve, the processor) drops the image.
+- **2**: the same, and once a picture has been read only through forwarding
+  for 30 loads, its resolve is no longer written to memory at all (no EDRAM
+  dump, no resolve pass). If anything then reads that memory another way, the
+  log says so and it is written to memory again from then on.
+
+`ps5_resolve_forward_check = true` checks it: every 5 s one forwarded picture
+is loaded the usual way as well and both are read back and compared. On the
+Linux test build every check, of every picture including the frame sent to the
+screen, found 0 of 3,686,400 pixels different.
+
+Linux test build, `resolution_scale = 2`, the in-game window of the save-room
+script (Radeon 760M):
+
+| | off | 1 | 2 |
+|---|---|---|---|
+| frames a second | 23.0 | 23.7 | 26.8 |
+| resolves | 6.8 ms | 8.9 ms | 3.9 ms |
+| resolved pictures read back | 7.4 ms | 4.5 ms | 4.5 ms |
+
+What is left in both is mostly the depth picture (k_24_8, a float texture made
+from a D24S8 target: it needs a conversion shader, next).
+
 ## A frame, as recorded
 
 `ps5/tools/d3d_frame_summary.py logs/d3d_frame_<n>.txt` turns a recorded frame

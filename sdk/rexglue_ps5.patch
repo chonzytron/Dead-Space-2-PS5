@@ -413,10 +413,22 @@ index ac6b056e..9fab334f 100644
    RegisterFile register_file_;
    std::unique_ptr<CommandProcessor> command_processor_;
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
-index d26cd4fb..fffad831 100644
+index d26cd4fb..fe41ab83 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
 +++ b/include/rex/graphics/pipeline/texture/cache.h
-@@ -220,15 +220,15 @@ class TextureCache {
+@@ -81,6 +81,11 @@ class TextureCache {
+   virtual void BeginFrame();
+ 
+   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
++  // [ps5 port] Something wrote [first, last] of guest memory (a resolve, or the
++  // processor): a forwarded resolve's picture of it is out of date
++  // (VulkanTextureCache, ps5_resolve_forward). May be called on any thread,
++  // with the global lock held.
++  virtual void ForwardedRangeWritten(uint32_t /*first*/, uint32_t /*last*/) {}
+   // Ensures the memory backing the range in the scaled resolve address space is
+   // allocated and returns whether it is.
+   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
+@@ -220,15 +225,15 @@ class TextureCache {
      static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
      uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
  
@@ -436,7 +448,7 @@ index d26cd4fb..fffad831 100644
  
      // For LRU caching - updates the last usage frame and moves the texture to
      // the end of the usage queue. Must be called any time the texture is
-@@ -565,7 +565,7 @@ class TextureCache {
+@@ -565,7 +570,7 @@ class TextureCache {
    void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
  
    // Shared memory callback for texture data invalidation.
@@ -445,7 +457,7 @@ index d26cd4fb..fffad831 100644
                              void* context, void* data, uint64_t argument, bool invalidated_by_gpu);
  
    // Checks if there are any pages that contain scaled resolve data within the
-@@ -574,9 +574,9 @@ class TextureCache {
+@@ -574,9 +579,9 @@ class TextureCache {
    // Global shared memory invalidation callback for invalidating scaled resolved
    // texture data.
    static void ScaledResolveGlobalWatchCallbackThunk(
@@ -573,10 +585,10 @@ index 4d85a2b5..1438d9bf 100644
      GlobalWatchCallback callback;
      void* callback_context;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff481..1999a394 100644
+index 696ff481..81545054 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -143,6 +143,45 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -143,6 +143,50 @@ class VulkanCommandProcessor : public CommandProcessor {
    bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                            std::vector<uint32_t>& spirv_out, std::string& error_out) const;
  
@@ -603,6 +615,11 @@ index 696ff481..1999a394 100644
 +  // An EDRAM transfer between two render targets (their RenderTargetKey
 +  // values), for the profiling report: which switches the copies come from.
 +  void NoteGpuTransfer(uint32_t source_key, uint32_t dest_key, uint32_t tiles, bool skipped);
++  // [ps5 port] While profiling: a resolve, or a resolved picture read back as a
++  // texture, as words for the report (the most frequent of each are listed:
++  // what a native resolve has to cover).
++  void NoteGpuResolve(std::string description);
++  void NoteGpuResolvedLoad(std::string description);
 +  // Sets a kind of work for as long as it lives, then the one before.
 +  class GpuPhaseScope {
 +   public:
@@ -622,7 +639,7 @@ index 696ff481..1999a394 100644
    // Returns the deferred drawing command list for the currently open
    // submission.
    DeferredCommandBuffer& deferred_command_buffer() {
-@@ -727,6 +766,86 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -727,6 +771,87 @@ class VulkanCommandProcessor : public CommandProcessor {
    uint64_t scratch_buffer_last_usage_submission_ = 0;
    bool scratch_buffer_used_ = false;
  
@@ -704,16 +721,55 @@ index 696ff481..1999a394 100644
 +    uint64_t count = 0, tiles = 0, skipped = 0;
 +  };
 +  std::unordered_map<uint64_t, GpuTransferStats> gpu_transfer_stats_;
++  std::unordered_map<std::string, uint64_t> gpu_resolve_stats_, gpu_resolved_load_stats_;
 +  uint64_t gpu_phase_report_ms_ = 0, gpu_phase_report_swaps_ = 0;
 +
    static constexpr uint32_t kMaxOcclusionQueries = 8192;
    VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
    VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
-index 9d2a8485..95b5ada9 100644
+index 9d2a8485..b0be86a8 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
 +++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
-@@ -265,6 +265,16 @@ class DeferredCommandBuffer {
+@@ -203,6 +203,37 @@ class DeferredCommandBuffer {
+     args.region_count = region_count;
+     return reinterpret_cast<VkBufferImageCopy*>(args_ptr + header_size);
+   }
++  // [ps5 port] Image to image (resolve forwarding).
++  void CmdVkBlitImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
++                      VkImageLayout dst_image_layout, const VkImageBlit& region, VkFilter filter) {
++    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(
++        WriteCommand(Command::kVkBlitImage, sizeof(ArgsVkBlitImage)));
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region = region;
++    args.filter = filter;
++  }
++  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
++                      VkImageLayout dst_image_layout, const VkImageCopy& region) {
++    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(
++        WriteCommand(Command::kVkCopyImage, sizeof(ArgsVkCopyImage)));
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region = region;
++  }
++  void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
++                              VkBuffer dst_buffer, const VkBufferImageCopy& region) {
++    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(
++        WriteCommand(Command::kVkCopyImageToBuffer, sizeof(ArgsVkCopyImageToBuffer)));
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_buffer = dst_buffer;
++    args.region = region;
++  }
+   void CmdVkCopyBufferToImage(VkBuffer src_buffer, VkImage dst_image,
+                               VkImageLayout dst_image_layout, uint32_t region_count,
+                               const VkBufferImageCopy* regions) {
+@@ -265,6 +296,16 @@ class DeferredCommandBuffer {
    void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
    void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
  
@@ -730,7 +786,17 @@ index 9d2a8485..95b5ada9 100644
    void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
      auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
          WriteCommand(Command::kVkResetQueryPool, sizeof(ArgsVkResetQueryPool)));
-@@ -381,6 +391,7 @@ class DeferredCommandBuffer {
+@@ -363,6 +404,9 @@ class DeferredCommandBuffer {
+     kVkClearColorImage,
+     kVkCopyBuffer,
+     kVkCopyBufferToImage,
++    kVkBlitImage,  // [ps5 port]
++    kVkCopyImage,  // [ps5 port]
++    kVkCopyImageToBuffer,  // [ps5 port]
+     kVkCopyQueryPoolResults,
+     kVkDispatch,
+     kVkDraw,
+@@ -381,6 +425,7 @@ class DeferredCommandBuffer {
      kVkSetStencilReference,
      kVkSetStencilWriteMask,
      kVkSetViewport,
@@ -738,7 +804,37 @@ index 9d2a8485..95b5ada9 100644
    };
  
    struct CommandHeader {
-@@ -520,6 +531,12 @@ class DeferredCommandBuffer {
+@@ -475,6 +520,29 @@ class DeferredCommandBuffer {
+     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
+   };
+ 
++  struct ArgsVkBlitImage {
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    VkImageBlit region;
++    VkFilter filter;
++  };
++  struct ArgsVkCopyImage {
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    VkImageCopy region;
++  };
++
++  struct ArgsVkCopyImageToBuffer {
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkBuffer dst_buffer;
++    VkBufferImageCopy region;
++  };
++
+   struct ArgsVkCopyBufferToImage {
+     VkBuffer src_buffer;
+     VkImage dst_image;
+@@ -520,6 +588,12 @@ class DeferredCommandBuffer {
      uint32_t query;
    };
  
@@ -752,7 +848,7 @@ index 9d2a8485..95b5ada9 100644
      VkQueryPool query_pool;
      uint32_t first_query;
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 34f70337..311565d6 100644
+index 34f70337..f3bc2e48 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
 @@ -10,6 +10,7 @@
@@ -774,6 +870,101 @@ index 34f70337..311565d6 100644
    union RenderPassKey {
      struct {
        // If emulating 2x as 4x, this is still 2x for simplicity of using this
+@@ -802,6 +807,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+ 
+   VkPipeline GetDumpPipeline(DumpPipelineKey key);
+   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
++  // [ps5 port] see VulkanTextureCache::ForwardResolve
++  VulkanRenderTarget* FindWholeForwardSource(const draw_util::ResolveInfo& resolve_info);
++  void ForwardResolveFrom(VulkanRenderTarget* render_target,
++                          const draw_util::ResolveInfo& resolve_info,
++                          VulkanTextureCache& texture_cache, bool memory_skipped);
+   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+                               draw_util::ResolveCopyShaderIndex copy_shader,
+                               bool draw_resolution_scaled);
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee7..5461c08a 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -133,6 +133,27 @@ class VulkanTextureCache final : public TextureCache {
+   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
+                                       uint64_t written_length_scaled);
+ 
++  // [ps5 port] Resolve forwarding (ps5_resolve_forward): a resolve's picture
++  // kept as an image, copied straight into the texture that reads it back
++  // instead of untiling the resolved memory. The resolve is written to memory
++  // as before; this only spares the read-back. For now: a whole 32bpp colour
++  // picture (k_8_8_8_8 to k_8_8_8_8), one mip, at a scaled resolution.
++  bool IsResolveForwardingEnabled() const;
++  // src_image (in TRANSFER_SRC_OPTIMAL) [0, width_scaled) x [0, height_scaled)
++  // is the picture resolved to guest memory [dest_base, dest_base +
++  // dest_length) as a width x height texture of the given pitch, format and
++  // endianness, red and blue swapped if swap. Call after MarkRangeAsResolved.
++  void ForwardResolve(VkImage src_image, uint32_t width_scaled, uint32_t height_scaled,
++                      uint32_t dest_base, uint32_t dest_length, uint32_t width, uint32_t height,
++                      uint32_t pitch, uint32_t format, uint32_t endian, bool swap,
++                      bool memory_skipped);
++  // ps5_resolve_forward = 2: whether this resolve's picture has only ever been
++  // read through forwarding (for kForwardProofLoads loads in a row), so its
++  // write to memory can be left out.
++  bool CanResolveSkipMemory(const draw_util::ResolveInfo& resolve_info) const;
++  static constexpr uint32_t kForwardProofLoads = 30;
++  void ForwardedRangeWritten(uint32_t first, uint32_t last) override;
++
+  protected:
+   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
+@@ -319,6 +340,50 @@ class VulkanTextureCache final : public TextureCache {
+ 
+   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
+ 
++  // [ps5 port] Resolve forwarding: the picture for this texture, copied into
++  // it, if one is kept and current.
++  bool LoadForwardedResolve(VulkanTexture& texture);
++  // A texture loaded from resolved memory the usual way: forwarded pictures it
++  // overlaps are always written to memory from now on.
++  void NoteUnforwardedResolvedLoad(const TextureKey& key, uint32_t size);
++  struct ForwardedResolve {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    uint32_t width_scaled = 0, height_scaled = 0;
++    uint32_t dest_base = 0, dest_last = 0, width = 0, height = 0, pitch = 0, guest_format = 0,
++             endian = 0;
++    bool swap = false;
++    uint64_t last_used = 0;
++    // Forwarded loads in a row; whether something else read the memory (then
++    // it is always written); whether the memory was left stale by the last
++    // resolve.
++    uint32_t proof_loads = 0;
++    bool needs_memory = false;
++    bool memory_stale = false;
++    // Set by ForwardResolve, cleared by a write to the range (any thread).
++    std::atomic<bool> current{false};
++  };
++  // ps5_resolve_forward_check: now and then, a texture that could be forwarded
++  // is loaded as before, and both it and the forwarded picture are read back
++  // and compared, in the log.
++  struct ForwardCheck {
++    VkBuffer buffers[2] = {};
++    VkDeviceMemory memories[2] = {};
++    VkDeviceSize size = 0;
++    uint64_t submission = 0;
++    uint32_t base = 0, width = 0, height = 0;
++    bool pending = false;
++    uint64_t next_ms = 0;
++  };
++  ForwardCheck forward_check_;
++  ForwardedResolve* forward_check_slot_ = nullptr;  // (set for the load being checked)
++  void RecordForwardCheck(VulkanTexture& texture, ForwardedResolve& forwarded);
++  void FinishForwardCheck();
++  static constexpr size_t kForwardedResolveCount = 16;
++  std::array<ForwardedResolve, kForwardedResolveCount> forwarded_resolves_;
++  uint64_t forwarded_resolve_clock_ = 0;
++
+   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,
+                             VkAccessFlags& access_mask, VkImageLayout& layout);
+   bool EnsureScaledResolveBufferAllocated(uint64_t start_scaled, uint64_t length_scaled);
 diff --git a/include/rex/input/ps5/ps5_input_driver.h b/include/rex/input/ps5/ps5_input_driver.h
 new file mode 100644
 index 00000000..870db03b
@@ -1375,10 +1566,19 @@ index 00000000..61d85885
 +}  // namespace ui
 +}  // namespace rex
 diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
-index aa55a4a2..52cdebef 100644
+index aa55a4a2..e513578f 100644
 --- a/include/rex/ui/vulkan/functions/device_1_0.inc
 +++ b/include/rex/ui/vulkan/functions/device_1_0.inc
-@@ -28,6 +28,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdResetQueryPool)
+@@ -14,6 +14,8 @@ XE_UI_VULKAN_FUNCTION(vkCmdClearAttachments)
+ XE_UI_VULKAN_FUNCTION(vkCmdClearColorImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBufferToImage)
++XE_UI_VULKAN_FUNCTION(vkCmdBlitImage)  // [ps5 port] resolve forwarding
++XE_UI_VULKAN_FUNCTION(vkCmdCopyImage)  // [ps5 port] resolve forwarding
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyImageToBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkCmdDispatch)
+@@ -28,6 +30,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdResetQueryPool)
  XE_UI_VULKAN_FUNCTION(vkCmdSetBlendConstants)
  XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias)
  XE_UI_VULKAN_FUNCTION(vkCmdSetScissor)
@@ -1386,7 +1586,7 @@ index aa55a4a2..52cdebef 100644
  XE_UI_VULKAN_FUNCTION(vkCmdSetStencilCompareMask)
  XE_UI_VULKAN_FUNCTION(vkCmdSetStencilReference)
  XE_UI_VULKAN_FUNCTION(vkCmdSetStencilWriteMask)
-@@ -71,6 +72,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
+@@ -71,6 +74,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
  XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
  XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
  XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
@@ -3818,10 +4018,18 @@ index 8f2fcb0b..49295874 100644
  
  void GraphicsSystem::ClearCaches() {
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
-index 76f5600c..989fc100 100644
+index 76f5600c..e611ea51 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
 +++ b/src/graphics/pipeline/texture/cache.cpp
-@@ -687,7 +687,7 @@ TextureCache::Texture::~Texture() {
+@@ -324,6 +324,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
+   }
+   start_unscaled &= 0x1FFFFFFF;
+   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
++  ForwardedRangeWritten(start_unscaled, start_unscaled + length_unscaled - 1);  // [ps5 port]
+ 
+   if (IsDrawResolutionScaled()) {
+     uint32_t page_first = start_unscaled >> 12;
+@@ -687,7 +688,7 @@ TextureCache::Texture::~Texture() {
  }
  
  void TextureCache::Texture::MakeUpToDateAndWatch(
@@ -3830,7 +4038,7 @@ index 76f5600c..989fc100 100644
    SharedMemory& shared_memory = texture_cache().shared_memory();
    if (base_outdated_) {
      assert_not_zero(GetGuestBaseSize());
-@@ -733,7 +733,7 @@ void TextureCache::Texture::MarkAsUsed() {
+@@ -733,7 +734,7 @@ void TextureCache::Texture::MarkAsUsed() {
  }
  
  void TextureCache::Texture::WatchCallback(
@@ -3839,7 +4047,7 @@ index 76f5600c..989fc100 100644
    if (is_mip) {
      assert_not_zero(GetGuestMipsSize());
      mips_outdated_ = true;
-@@ -747,7 +747,7 @@ void TextureCache::Texture::WatchCallback(
+@@ -747,7 +748,7 @@ void TextureCache::Texture::WatchCallback(
    }
  }
  
@@ -3848,7 +4056,7 @@ index 76f5600c..989fc100 100644
                                   void* context, void* data, uint64_t argument,
                                   bool invalidated_by_gpu) {
    Texture& texture = *static_cast<Texture*>(context);
-@@ -1064,7 +1064,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
+@@ -1064,7 +1065,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
  }
  
  void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
@@ -3857,7 +4065,7 @@ index 76f5600c..989fc100 100644
      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
    TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
    texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
-@@ -1072,7 +1072,7 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
+@@ -1072,13 +1073,14 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
  }
  
  void TextureCache::ScaledResolveGlobalWatchCallback(
@@ -3866,6 +4074,13 @@ index 76f5600c..989fc100 100644
      uint32_t address_last, bool invalidated_by_gpu) {
    assert_true(IsDrawResolutionScaled());
    if (invalidated_by_gpu) {
+     // Resolves themselves do exactly the opposite of what this should do.
+     return;
+   }
++  ForwardedRangeWritten(address_first, address_last);  // [ps5 port]
+   // Mark scaled resolve ranges as non-scaled. Textures themselves will be
+   // invalidated by their shared memory watches.
+   uint32_t resolve_page_first = address_first >> 12;
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
 index ec0df7c8..25ca96ba 100644
 --- a/src/graphics/shared_memory.cpp
@@ -4223,7 +4438,7 @@ index ec0df7c8..25ca96ba 100644
      uint64_t invalidate_bits = UINT64_MAX;
      if (i == block_first) {
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 6207c1c6..afe30003 100644
+index 6207c1c6..672da61a 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -4315,7 +4530,7 @@ index 6207c1c6..afe30003 100644
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
-@@ -4757,6 +4783,343 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
+@@ -4757,6 +4783,366 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
    }
  }
  
@@ -4433,6 +4648,14 @@ index 6207c1c6..afe30003 100644
 +  ++stats.count;
 +  stats.tiles += tiles;
 +  stats.skipped += skipped ? 1 : 0;
++}
++
++void VulkanCommandProcessor::NoteGpuResolve(std::string description) {
++  ++gpu_resolve_stats_[std::move(description)];
++}
++
++void VulkanCommandProcessor::NoteGpuResolvedLoad(std::string description) {
++  ++gpu_resolved_load_stats_[std::move(description)];
 +}
 +
 +void VulkanCommandProcessor::SetGpuPhase(GpuPhase phase) {
@@ -4595,6 +4818,21 @@ index 6207c1c6..afe30003 100644
 +    }
 +    gpu_transfer_stats_.clear();
 +  }
++  // The resolves, and the resolved pictures read back as textures, the most
++  // frequent first.
++  auto report_counts = [frames](const char* what, std::unordered_map<std::string, uint64_t>& stats) {
++    std::vector<std::pair<std::string, uint64_t>> sorted(stats.begin(), stats.end());
++    const size_t top = std::min<size_t>(sorted.size(), 12);
++    std::partial_sort(sorted.begin(), sorted.begin() + std::ptrdiff_t(top), sorted.end(),
++                      [](const auto& a, const auto& b) { return a.second > b.second; });
++    for (size_t i = 0; i < top; ++i) {
++      REXGPU_INFO("ps5 gpu {} {}: {:.1f} a frame, {}", what, i + 1, double(sorted[i].second) / frames,
++                  sorted[i].first);
++    }
++    stats.clear();
++  };
++  report_counts("resolve", gpu_resolve_stats_);
++  report_counts("resolved load", gpu_resolved_load_stats_);
 +  gpu_phase_ns_.fill(0.0);
 +  gpu_phase_entries_.fill(0);
 +  gpu_phase_draws_by_msaa_.fill(0);
@@ -4659,7 +4897,7 @@ index 6207c1c6..afe30003 100644
  bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
    active_occlusion_query_ = {};
    occlusion_query_cursor_ = 0;
-@@ -4997,9 +5360,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -4997,9 +5383,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
      // defined by vkQueueSubmit additionally include in the first
      // synchronization scope all commands that occur earlier in submission
      // order."
@@ -4678,7 +4916,7 @@ index 6207c1c6..afe30003 100644
      if (wait_result == VK_SUCCESS) {
        fences_awaited += await_submission - submission_completed_;
      } else {
-@@ -5041,6 +5413,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5041,6 +5436,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                        submissions_in_flight_fences_awaited_end);
    submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                        submissions_in_flight_fences_awaited_end);
@@ -4687,7 +4925,7 @@ index 6207c1c6..afe30003 100644
    submission_completed_ += fences_awaited;
  
    // Reclaim semaphores.
-@@ -5163,6 +5537,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5163,6 +5560,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -4695,7 +4933,7 @@ index 6207c1c6..afe30003 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5412,7 +5787,37 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5412,7 +5810,37 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -4733,7 +4971,7 @@ index 6207c1c6..afe30003 100644
      if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
        REXGPU_ERROR("Failed to end a Vulkan command buffer");
        return false;
-@@ -5457,6 +5862,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5457,6 +5885,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        return false;
      }
      uint64_t submission_current = GetCurrentSubmission();
@@ -4748,10 +4986,35 @@ index 6207c1c6..afe30003 100644
      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
 diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
-index b49e033b..51215f22 100644
+index b49e033b..4751e990 100644
 --- a/src/graphics/vulkan/deferred_command_buffer.cpp
 +++ b/src/graphics/vulkan/deferred_command_buffer.cpp
-@@ -314,6 +314,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+@@ -156,6 +156,24 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
+       } break;
+ 
++      case Command::kVkBlitImage: {
++        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
++        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++                           args.dst_image_layout, 1, &args.region, args.filter);
++      } break;
++
++      case Command::kVkCopyImage: {
++        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
++        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++                           args.dst_image_layout, 1, &args.region);
++      } break;
++
++      case Command::kVkCopyImageToBuffer: {
++        auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
++        dfn.vkCmdCopyImageToBuffer(command_buffer, args.src_image, args.src_image_layout,
++                                   args.dst_buffer, 1, &args.region);
++      } break;
++
+       case Command::kVkCopyQueryPoolResults: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
+         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
+@@ -314,6 +332,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                   rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
        } break;
  
@@ -4790,10 +5053,19 @@ index 77e61060..abc39793 100644
    const ui::vulkan::VulkanDevice::Functions& dfn = vd->functions();
    const VkDevice device = vd->device();
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f062..7f106fde 100644
+index 0298f062..82badaef 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
-@@ -41,6 +41,15 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+@@ -21,6 +21,8 @@
+ 
+ #include <SPIRV/GLSL.std.450.h>
+ 
++#include <fmt/format.h>
++#include <rex/ps5_diag.h>  // [ps5 port]
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/graphics/flags.h>
+@@ -41,6 +43,15 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                        "Vulkan render target implementation path")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
@@ -4809,7 +5081,7 @@ index 0298f062..7f106fde 100644
  // DEFINE_string(
  //     render_target_path_vulkan, "",
  //     "Render target emulation path to use on Vulkan.\n"
-@@ -180,6 +189,17 @@ const VulkanRenderTargetCache::TransferModeInfo
+@@ -180,6 +191,17 @@ const VulkanRenderTargetCache::TransferModeInfo
          {TransferOutput::kDepth, TransferPipelineLayoutIndex::kDepthAndHostDepthBuffer},
  };
  
@@ -4827,7 +5099,90 @@ index 0298f062..7f106fde 100644
  VulkanRenderTargetCache::VulkanRenderTargetCache(const RegisterFile& register_file,
                                                   const memory::Memory& memory,
                                                   uint32_t draw_resolution_scale_x,
-@@ -1397,8 +1417,52 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+@@ -1145,14 +1167,67 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+     return true;
+   }
+ 
++#if REX_PS5_PROGRAM
++  // [ps5 port] While profiling: what the resolve is, for the report.
++  if (rex::ps5diag::ProfilerRunning()) {
++    const bool depth = resolve_info.IsCopyingDepth();
++    const draw_util::ResolveEdramInfo& edram =
++        depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
++    std::string what;
++    if (resolve_info.copy_dest_extent_length) {
++      const reg::RB_COPY_DEST_INFO dest = resolve_info.copy_dest_info;
++      what = fmt::format(
++          "{} {} {}x at tile {} pitch {}, {}x{} -> texture format {} at {:08X} (pitch {}, height {}, "
++          "offset {},{}), endian {}, exp bias {}, swap {}, samples {}",
++          depth ? std::string("depth") : fmt::format("color {}", uint32_t(resolve_info.rb_copy_control.copy_src_select)),
++          depth ? xenos::GetDepthRenderTargetFormatName(xenos::DepthRenderTargetFormat(edram.format))
++                : xenos::GetColorRenderTargetFormatName(xenos::ColorRenderTargetFormat(edram.format)),
++          1u << uint32_t(edram.msaa_samples), edram.base_tiles, edram.pitch_tiles,
++          resolve_info.coordinate_info.width_div_8 * 8, resolve_info.height_div_8 * 8,
++          uint32_t(dest.copy_dest_format), resolve_info.copy_dest_base,
++          resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
++          resolve_info.copy_dest_coordinate_info.height_aligned_div_32 * 32,
++          resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8,
++          resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8, uint32_t(dest.copy_dest_endian),
++          int32_t(dest.copy_dest_exp_bias), uint32_t(dest.copy_dest_swap),
++          uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select));
++    } else {
++      what = "no copy";
++    }
++    if (resolve_info.IsClearingColor() || resolve_info.IsClearingDepth()) {
++      what += fmt::format(", clearing{}{}", resolve_info.IsClearingColor() ? " color" : "",
++                          resolve_info.IsClearingDepth() ? " depth" : "");
++    }
++    command_processor_.NoteGpuResolve(std::move(what));
++  }
++#endif
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+ 
++  // [ps5 port] Resolve forwarding (VulkanTextureCache::ForwardResolve): the
++  // render target holding the whole picture, if it can be forwarded, and
++  // whether its write to memory can be left out.
++  VulkanRenderTarget* forward_source = nullptr;
++  bool forward_skips_memory = false;
++  if (resolve_info.copy_dest_extent_length && draw_resolution_scaled &&
++      GetPath() == Path::kHostRenderTargets && texture_cache.IsResolveForwardingEnabled()) {
++    forward_source = FindWholeForwardSource(resolve_info);
++    forward_skips_memory = forward_source && texture_cache.CanResolveSkipMemory(resolve_info);
++  }
++
+   // Copying.
+   bool copied = false;
+-  if (resolve_info.copy_dest_extent_length) {
++  if (forward_skips_memory) {
++    texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
++                                      resolve_info.copy_dest_extent_length);
++    ForwardResolveFrom(forward_source, resolve_info, texture_cache, true);
++    written_address_out = resolve_info.copy_dest_extent_start;
++    written_length_out = resolve_info.copy_dest_extent_length;
++    copied = true;
++  } else if (resolve_info.copy_dest_extent_length) {
+     draw_util::ResolveCopyShaderConstants copy_shader_constants;
+     uint32_t copy_group_count_x, copy_group_count_y;
+     draw_util::ResolveCopyShaderIndex copy_shader =
+@@ -1291,6 +1366,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
++
++          // [ps5 port] Resolve forwarding: a whole 32bpp colour picture is also
++          // kept as an image, for the texture that reads it back
++          // (VulkanTextureCache::ForwardResolve).
++          if (forward_source) {
++            ForwardResolveFrom(forward_source, resolve_info, texture_cache, false);
++          }
+         }
+       }
+     }
+@@ -1397,8 +1479,52 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
        RenderTarget* const* depth_and_color_render_targets =
            last_update_accumulated_render_targets();
  
@@ -4882,6 +5237,85 @@ index 0298f062..7f106fde 100644
  
        if (depth_and_color_render_targets[0]) {
          render_pass_key.depth_and_color_used |= 1 << 0;
+@@ -1900,6 +2026,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+     }
+     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    // [ps5 port] Resolve forwarding blits from it (VulkanTextureCache::ForwardResolve).
++    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   }
+   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
+     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
+@@ -5971,6 +6099,69 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
+   return pipeline;
+ }
+ 
++VulkanRenderTargetCache::VulkanRenderTarget* VulkanRenderTargetCache::FindWholeForwardSource(
++    const draw_util::ResolveInfo& resolve_info) {
++  const draw_util::ResolveEdramInfo& edram = resolve_info.color_edram_info;
++  const reg::RB_COPY_DEST_INFO dest = resolve_info.copy_dest_info;
++  const draw_util::ResolveCopyDestCoordinateInfo dest_coordinates =
++      resolve_info.copy_dest_coordinate_info;
++  if (resolve_info.IsCopyingDepth() || edram.msaa_samples != xenos::MsaaSamples::k1X ||
++      xenos::ColorRenderTargetFormat(edram.format) != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++      dest.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest.copy_dest_exp_bias ||
++      dest.copy_dest_array || uint32_t(dest.copy_dest_endian) > 3 ||
++      dest_coordinates.offset_x_div_8 || dest_coordinates.offset_y_div_8 ||
++      resolve_info.coordinate_info.edram_offset_x_div_8 ||
++      resolve_info.coordinate_info.edram_offset_y_div_8) {
++    return nullptr;
++  }
++  // The one render target holding all of it, from its origin.
++  uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
++  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
++  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
++                                 dump_rectangles_);
++  if (dump_rectangles_.size() != 1) {
++    return nullptr;
++  }
++  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
++  auto* render_target = static_cast<VulkanRenderTarget*>(rectangle.render_target);
++  if (!render_target || rectangle.row_first || rectangle.rows != dump_rows) {
++    return nullptr;
++  }
++  const RenderTargetKey key = render_target->key();
++  if (key.is_depth || key.base_tiles != dump_base || key.msaa_samples != xenos::MsaaSamples::k1X ||
++      key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++      key.pitch_tiles_at_32bpp != dump_pitch) {
++    return nullptr;
++  }
++  return render_target;
++}
++
++void VulkanRenderTargetCache::ForwardResolveFrom(VulkanRenderTarget* render_target,
++                                                 const draw_util::ResolveInfo& resolve_info,
++                                                 VulkanTextureCache& texture_cache,
++                                                 bool memory_skipped) {
++  const reg::RB_COPY_DEST_INFO dest = resolve_info.copy_dest_info;
++  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
++  const uint32_t height = resolve_info.height_div_8 * 8;
++  // The render target as the blit's source.
++  constexpr VkPipelineStageFlags kStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++  constexpr VkAccessFlags kAccess = VK_ACCESS_TRANSFER_READ_BIT;
++  constexpr VkImageLayout kLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  command_processor_.PushImageMemoryBarrier(
++      render_target->image(), ui::vulkan::util::InitializeSubresourceRange(),
++      render_target->current_stage_mask(), kStage, render_target->current_access_mask(), kAccess,
++      render_target->current_layout(), kLayout);
++  render_target->SetUsage(kStage, kAccess, kLayout);
++  texture_cache.ForwardResolve(
++      render_target->image(), width * draw_resolution_scale_x(),
++      height * draw_resolution_scale_y(), resolve_info.copy_dest_base,
++      resolve_info.copy_dest_extent_start + resolve_info.copy_dest_extent_length -
++          resolve_info.copy_dest_base,
++      width, height, resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
++      uint32_t(dest.copy_dest_format), uint32_t(dest.copy_dest_endian), dest.copy_dest_swap != 0,
++      memory_skipped);
++}
++
+ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+                                                      draw_util::ResolveCopyShaderIndex copy_shader,
+                                                      bool draw_resolution_scaled) {
 diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
 index 962ba33e..58802ded 100644
 --- a/src/graphics/vulkan/shared_memory.cpp
@@ -4896,10 +5330,57 @@ index 962ba33e..58802ded 100644
    // ordering barrier.
    Use(Usage::kTransferDestination,
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940d..824a0f20 100644
+index ecbd940d..ec8829cf 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
-@@ -1215,6 +1215,10 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+@@ -15,6 +15,8 @@
+ #include <cstring>
+ #include <utility>
+ 
++#include <fmt/format.h>
++#include <rex/ps5_diag.h>  // [ps5 port]
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/logging.h>
+@@ -34,6 +36,14 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
++// [ps5 port] see VulkanTextureCache::ForwardResolve
++REXCVAR_DEFINE_BOOL(ps5_resolve_forward_check, false, "PS5",
++                    "With ps5_resolve_forward: every 5 s, compare a forwarded picture with the "
++                    "texture loaded as before, in the log (for testing)");
++REXCVAR_DEFINE_INT32(ps5_resolve_forward, 0, "PS5",
++                     "Resolved pictures copied straight into the textures that read them back "
++                     "(needs resolution_scale above 1): 0 off, 1 instead of untiled from memory, 2 "
++                     "and not written to memory either once only forwarding reads them");
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -437,6 +447,14 @@ VulkanTextureCache::~VulkanTextureCache() {
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+ 
++  for (ForwardedResolve& forwarded : forwarded_resolves_) {  // [ps5 port]
++    if (forwarded.image != VK_NULL_HANDLE) {
++      dfn.vkDestroyImage(device, forwarded.image, nullptr);
++      dfn.vkFreeMemory(device, forwarded.memory, nullptr);
++      forwarded.image = VK_NULL_HANDLE;
++    }
++  }
++
+   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
+     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
+   }
+@@ -527,6 +545,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
+ 
+ void VulkanTextureCache::BeginFrame() {
+   TextureCache::BeginFrame();
++  FinishForwardCheck();  // [ps5 port]
+ 
+   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
+ }
+@@ -1215,8 +1234,33 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
  
  bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                 bool load_mips) {
@@ -4909,7 +5390,393 @@ index ecbd940d..824a0f20 100644
 +                              : VulkanCommandProcessor::GpuPhase::kTextureLoad);
    VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
    TextureKey texture_key = vulkan_texture.key();
++  // [ps5 port] A forwarded resolve: copied, not untiled.
++  forward_check_slot_ = nullptr;
++  if (texture_key.scaled_resolve && load_base && IsResolveForwardingEnabled() &&
++      LoadForwardedResolve(vulkan_texture)) {
++    return true;
++  }
++  if (texture_key.scaled_resolve && IsResolveForwardingEnabled() && !forward_check_slot_) {
++    NoteUnforwardedResolvedLoad(texture_key, vulkan_texture.GetGuestBaseSize() +
++                                                 (load_mips ? vulkan_texture.GetGuestMipsSize() : 0));
++  }
++#if REX_PS5_PROGRAM
++  // [ps5 port] While profiling: which resolved pictures are read back.
++  if (texture_key.scaled_resolve && rex::ps5diag::ProfilerRunning()) {
++    command_processor_.NoteGpuResolvedLoad(fmt::format(
++        "texture format {} at {:08X}, {}x{} (pitch {}), tiled {}, mips {}, endian {}{}",
++        uint32_t(texture_key.format), texture_key.base_page << 12, texture_key.GetWidth(),
++        texture_key.GetHeight(), texture_key.pitch * 32, uint32_t(texture_key.tiled),
++        texture_key.mip_max_level + 1, uint32_t(texture_key.endianness),
++        texture_key.signed_separate ? ", signed" : ""));
++  }
++#endif
  
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+@@ -1783,6 +1827,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+   }
+ 
++  if (forward_check_slot_) {  // [ps5 port] ps5_resolve_forward_check
++    RecordForwardCheck(vulkan_texture, *forward_check_slot_);
++    forward_check_slot_ = nullptr;
++  }
+   return true;
+ }
+ 
+@@ -3258,4 +3306,351 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+   return clamp_mode;
+ }
+ 
++
++// [ps5 port] Resolve forwarding. On the Xbox 360 a resolve copies a render
++// target out of EDRAM into memory, where a texture reads it. Emulated, that is
++// three full-picture passes at the scaled resolution: the render target dumped
++// to the EDRAM buffer, the resolve into the scaled resolve buffer in the
++// guest's tiled layout, and, when a texture reads it, that untiled back into a
++// texture (LoadTextureDataFromResidentMemoryImpl). Here the render target is
++// also blitted into an image of its own at the resolve, and a texture that is
++// exactly that picture (address, size, pitch, format, endianness, one mip) is
++// filled from it with an image copy instead of the untiling. The memory is
++// still written, so whatever else reads it sees what it always did; a write
++// to the range afterwards (another resolve, the processor) drops the image.
++
++bool VulkanTextureCache::IsResolveForwardingEnabled() const {
++  static const bool enabled = REXCVAR_GET(ps5_resolve_forward) > 0;
++  return enabled && IsDrawResolutionScaled();
++}
++
++void VulkanTextureCache::ForwardedRangeWritten(uint32_t first, uint32_t last) {
++  for (ForwardedResolve& forwarded : forwarded_resolves_) {
++    if (forwarded.current.load(std::memory_order_relaxed) && first <= forwarded.dest_last &&
++        last >= forwarded.dest_base) {
++      forwarded.current.store(false, std::memory_order_release);
++    }
++  }
++}
++
++void VulkanTextureCache::ForwardResolve(VkImage src_image, uint32_t width_scaled,
++                                        uint32_t height_scaled, uint32_t dest_base,
++                                        uint32_t dest_length, uint32_t width, uint32_t height,
++                                        uint32_t pitch, uint32_t format, uint32_t endian,
++                                        bool swap, bool memory_skipped) {
++  if (!dest_length) {
++    return;
++  }
++  const VkFormat image_format = swap ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
++  // The same picture as before, or the least recently used slot.
++  ForwardedResolve* slot = nullptr;
++  ForwardedResolve* oldest = nullptr;
++  for (ForwardedResolve& forwarded : forwarded_resolves_) {
++    if (forwarded.image != VK_NULL_HANDLE && forwarded.dest_base == dest_base &&
++        forwarded.width_scaled == width_scaled && forwarded.height_scaled == height_scaled &&
++        forwarded.format == image_format) {
++      slot = &forwarded;
++      break;
++    }
++    if (!oldest || forwarded.last_used < oldest->last_used) {
++      oldest = &forwarded;
++    }
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  if (!slot) {
++    slot = oldest;
++    if (slot->image != VK_NULL_HANDLE) {
++      // All taken: the GPU may still be using them, so none is replaced; this
++      // picture just isn't forwarded.
++      return;
++    }
++    VkImageCreateInfo image_create_info = {};
++    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    image_create_info.imageType = VK_IMAGE_TYPE_2D;
++    image_create_info.format = image_format;
++    image_create_info.extent = {width_scaled, height_scaled, 1};
++    image_create_info.mipLevels = 1;
++    image_create_info.arrayLayers = 1;
++    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++            vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++            slot->image, slot->memory)) {
++      slot->image = VK_NULL_HANDLE;
++      REXGPU_WARN("ps5 resolve forwarding: no {}x{} image", width_scaled, height_scaled);
++      return;
++    }
++    slot->format = image_format;
++    slot->width_scaled = width_scaled;
++    slot->height_scaled = height_scaled;
++    REXGPU_INFO("ps5 resolve forwarding: an image for {:08X} ({}x{}, {}x{} scaled, format {}{})",
++                dest_base, width, height, width_scaled, height_scaled, format,
++                swap ? ", red and blue swapped" : "");
++  }
++  slot->dest_base = dest_base;
++  slot->dest_last = dest_base + dest_length - 1;
++  slot->width = width;
++  slot->height = height;
++  slot->pitch = pitch;
++  slot->guest_format = format;
++  slot->endian = endian;
++  slot->swap = swap;
++  slot->last_used = ++forwarded_resolve_clock_;
++  if (memory_skipped && !slot->memory_stale) {
++    REXGPU_INFO("ps5 resolve forwarding: {:08X} ({}x{}) no longer written to memory: only "
++                "forwarding has read it",
++                dest_base, width, height);
++  }
++  slot->memory_stale = memory_skipped;
++
++  // (the image was last read by a copy, or never used: its contents don't matter)
++  command_processor_.PushImageMemoryBarrier(
++      slot->image, ui::vulkan::util::InitializeSubresourceRange(), VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++  command_processor_.SubmitBarriers(true);
++  VkImageBlit blit = {};
++  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  blit.srcOffsets[1] = {int32_t(width_scaled), int32_t(height_scaled), 1};
++  blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  blit.dstOffsets[1] = {int32_t(width_scaled), int32_t(height_scaled), 1};
++  command_processor_.deferred_command_buffer().CmdVkBlitImage(
++      src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot->image,
++      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_NEAREST);
++  command_processor_.PushImageMemoryBarrier(
++      slot->image, ui::vulkan::util::InitializeSubresourceRange(), VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++  slot->current.store(true, std::memory_order_release);
++}
++
++bool VulkanTextureCache::LoadForwardedResolve(VulkanTexture& texture) {
++  const TextureKey key = texture.key();
++  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
++      key.mip_max_level || key.packed_mips || !key.tiled || key.signed_separate) {
++    return false;
++  }
++  const uint32_t base = key.base_page << 12;
++  for (ForwardedResolve& forwarded : forwarded_resolves_) {
++    if (forwarded.image == VK_NULL_HANDLE ||
++        !forwarded.current.load(std::memory_order_acquire) || forwarded.dest_base != base ||
++        forwarded.width != key.GetWidth() || forwarded.height != key.GetHeight() ||
++        forwarded.pitch != key.pitch * 32 || forwarded.guest_format != uint32_t(key.format) ||
++        forwarded.endian != uint32_t(key.endianness)) {
++      continue;
++    }
++    const HostFormatPair& host_format_pair = GetHostFormatPair(key);
++    if (host_format_pair.format_unsigned.format != VK_FORMAT_R8G8B8A8_UNORM ||
++        forwarded.width_scaled != key.GetWidth() * draw_resolution_scale_x() ||
++        forwarded.height_scaled != key.GetHeight() * draw_resolution_scale_y()) {
++      return false;
++    }
++    static const bool check = REXCVAR_GET(ps5_resolve_forward_check);
++    if (check && !forward_check_.pending && rex::ps5diag::NowMs() >= forward_check_.next_ms) {
++      // Loaded as before this time, and compared (RecordForwardCheck).
++      forward_check_slot_ = &forwarded;
++      return false;
++    }
++    texture.MarkAsUsed();
++    VulkanTexture::Usage texture_old_usage =
++        texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
++    if (texture_old_usage != VulkanTexture::Usage::kTransferDestination) {
++      VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
++      VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
++      VkImageLayout texture_old_layout, texture_new_layout;
++      GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
++                           texture_old_layout);
++      GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
++                           texture_dst_access_mask, texture_new_layout);
++      command_processor_.PushImageMemoryBarrier(
++          texture.image(), ui::vulkan::util::InitializeSubresourceRange(), texture_src_stage_mask,
++          texture_dst_stage_mask, texture_src_access_mask, texture_dst_access_mask,
++          texture_old_layout, texture_new_layout);
++    }
++    command_processor_.SubmitBarriers(true);
++    VkImageCopy copy = {};
++    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    copy.extent = {forwarded.width_scaled, forwarded.height_scaled, 1};
++    command_processor_.deferred_command_buffer().CmdVkCopyImage(
++        forwarded.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image(),
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
++    forwarded.last_used = ++forwarded_resolve_clock_;
++    if (forwarded.proof_loads < kForwardProofLoads) ++forwarded.proof_loads;
++#if REX_PS5_PROGRAM
++    if (rex::ps5diag::ProfilerRunning()) {
++      command_processor_.NoteGpuResolvedLoad(
++          fmt::format("forwarded: texture format {} at {:08X}, {}x{}", uint32_t(key.format), base,
++                      key.GetWidth(), key.GetHeight()));
++    }
++#endif
++    return true;
++  }
++  return false;
++}
++
++void VulkanTextureCache::RecordForwardCheck(VulkanTexture& texture, ForwardedResolve& forwarded) {
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  ForwardCheck& check = forward_check_;
++  const VkDeviceSize size = VkDeviceSize(forwarded.width_scaled) * forwarded.height_scaled * 4;
++  if (check.size != size) {
++    for (uint32_t i = 0; i < 2; ++i) {
++      if (check.buffers[i] != VK_NULL_HANDLE) {
++        dfn.vkDestroyBuffer(device, check.buffers[i], nullptr);
++        dfn.vkFreeMemory(device, check.memories[i], nullptr);
++        check.buffers[i] = VK_NULL_HANDLE;
++      }
++      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++              vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++              ui::vulkan::util::MemoryPurpose::kReadback, check.buffers[i], check.memories[i])) {
++        check.buffers[i] = VK_NULL_HANDLE;
++        check.size = 0;
++        return;
++      }
++    }
++    check.size = size;
++  }
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  // The texture, just loaded the usual way (in TRANSFER_DST_OPTIMAL), and the
++  // forwarded picture (TRANSFER_SRC_OPTIMAL), each into a buffer.
++  command_processor_.PushImageMemoryBarrier(
++      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++      VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++  command_processor_.SubmitBarriers(true);
++  VkBufferImageCopy region = {};
++  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.imageExtent = {forwarded.width_scaled, forwarded.height_scaled, 1};
++  command_buffer.CmdVkCopyImageToBuffer(texture.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                        check.buffers[0], region);
++  command_buffer.CmdVkCopyImageToBuffer(forwarded.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                        check.buffers[1], region);
++  command_processor_.PushImageMemoryBarrier(
++      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++      VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++  command_processor_.PushBufferMemoryBarrier(check.buffers[0], 0, VK_WHOLE_SIZE,
++                                             VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                             VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                                             VK_ACCESS_HOST_READ_BIT);
++  command_processor_.PushBufferMemoryBarrier(check.buffers[1], 0, VK_WHOLE_SIZE,
++                                             VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                             VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                                             VK_ACCESS_HOST_READ_BIT);
++  check.submission = command_processor_.GetCurrentSubmission();
++  check.base = forwarded.dest_base;
++  check.width = forwarded.width_scaled;
++  check.height = forwarded.height_scaled;
++  check.pending = true;
++}
++
++void VulkanTextureCache::FinishForwardCheck() {
++  ForwardCheck& check = forward_check_;
++  if (!check.pending || command_processor_.GetCompletedSubmission() < check.submission) {
++    return;
++  }
++  check.pending = false;
++  check.next_ms = rex::ps5diag::NowMs() + 5000;
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  void* mapped[2] = {};
++  for (uint32_t i = 0; i < 2; ++i) {
++    if (dfn.vkMapMemory(device, check.memories[i], 0, VK_WHOLE_SIZE, 0, &mapped[i]) !=
++        VK_SUCCESS) {
++      mapped[i] = nullptr;
++    }
++  }
++  if (mapped[0] && mapped[1]) {
++    // (both from non-coherent memory perhaps: invalidated first)
++    VkMappedMemoryRange ranges[2] = {};
++    for (uint32_t i = 0; i < 2; ++i) {
++      ranges[i].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++      ranges[i].memory = check.memories[i];
++      ranges[i].size = VK_WHOLE_SIZE;
++    }
++    dfn.vkInvalidateMappedMemoryRanges(device, 2, ranges);
++    const uint8_t* a = static_cast<const uint8_t*>(mapped[0]);
++    const uint8_t* b = static_cast<const uint8_t*>(mapped[1]);
++    uint64_t differing = 0, max_diff = 0;
++    uint32_t first_x = 0, first_y = 0, first_a = 0, first_b = 0;
++    uint64_t differing_rows[4] = {};  // (first row, first column, last row, elsewhere)
++    for (uint32_t y = 0; y < check.height; ++y) {
++      for (uint32_t x = 0; x < check.width; ++x) {
++        const size_t o = (size_t(y) * check.width + x) * 4;
++        uint32_t pa, pb;
++        std::memcpy(&pa, a + o, 4);
++        std::memcpy(&pb, b + o, 4);
++        if (pa == pb) continue;
++        if (!differing) {
++          first_x = x;
++          first_y = y;
++          first_a = pa;
++          first_b = pb;
++        }
++        ++differing;
++        for (uint32_t c = 0; c < 4; ++c) {
++          const int d = int(a[o + c]) - int(b[o + c]);
++          max_diff = std::max<uint64_t>(max_diff, uint64_t(d < 0 ? -d : d));
++        }
++        ++differing_rows[y == 0 ? 0 : x == 0 ? 1 : y == check.height - 1 ? 2 : 3];
++      }
++    }
++    REXGPU_INFO(
++        "ps5 resolve forwarding check {:08X} ({}x{}): {} of {} pixels differ (largest channel "
++        "difference {}; in the first row {}, first column {}, last row {}, elsewhere {}){}",
++        check.base, check.width, check.height, differing, uint64_t(check.width) * check.height,
++        max_diff, differing_rows[0], differing_rows[1], differing_rows[2], differing_rows[3],
++        differing ? fmt::format("; first at {},{}: loaded {:08X}, forwarded {:08X}", first_x,
++                                first_y, first_a, first_b)
++                  : std::string());
++  }
++  for (uint32_t i = 0; i < 2; ++i) {
++    if (mapped[i]) dfn.vkUnmapMemory(device, check.memories[i]);
++  }
++}
++
++bool VulkanTextureCache::CanResolveSkipMemory(const draw_util::ResolveInfo& resolve_info) const {
++  static const bool skip = REXCVAR_GET(ps5_resolve_forward) >= 2 &&
++                           !REXCVAR_GET(ps5_resolve_forward_check);
++  if (!skip) {
++    return false;
++  }
++  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
++  const uint32_t height = resolve_info.height_div_8 * 8;
++  for (const ForwardedResolve& forwarded : forwarded_resolves_) {
++    if (forwarded.image != VK_NULL_HANDLE && forwarded.dest_base == resolve_info.copy_dest_base &&
++        forwarded.width == width && forwarded.height == height &&
++        forwarded.swap == (resolve_info.copy_dest_info.copy_dest_swap != 0) &&
++        forwarded.endian == uint32_t(resolve_info.copy_dest_info.copy_dest_endian)) {
++      return !forwarded.needs_memory && forwarded.proof_loads >= kForwardProofLoads;
++    }
++  }
++  return false;
++}
++
++void VulkanTextureCache::NoteUnforwardedResolvedLoad(const TextureKey& key, uint32_t size) {
++  const uint32_t first = key.base_page << 12, last = first + std::max(size, UINT32_C(1)) - 1;
++  for (ForwardedResolve& forwarded : forwarded_resolves_) {
++    if (forwarded.image == VK_NULL_HANDLE || first > forwarded.dest_last ||
++        last < forwarded.dest_base || forwarded.needs_memory) {
++      continue;
++    }
++    forwarded.needs_memory = true;
++    forwarded.proof_loads = 0;
++    REXGPU_INFO("ps5 resolve forwarding: {:08X} ({}x{}) is read as a texture it doesn't match "
++                "(format {} at {:08X}, {}x{}){}: always written to memory from now on",
++                forwarded.dest_base, forwarded.width, forwarded.height, uint32_t(key.format), first,
++                key.GetWidth(), key.GetHeight(),
++                forwarded.memory_stale ? ", and this once read what was there before" : "");
++  }
++}
++
+ }  // namespace rex::graphics::vulkan
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
 index 3ea35358..ecc92087 100644
 --- a/src/input/CMakeLists.txt
