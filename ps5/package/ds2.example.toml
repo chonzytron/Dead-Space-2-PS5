@@ -54,6 +54,13 @@
 # The log (in the app's logs folder): info, debug or trace say more.
 #log_level = "info"
 
+# Experiment, for performance work: the copies the emulator makes when the
+# game switches the Xbox 360's EDRAM from one surface to another ("EDRAM
+# transfers" in the profile). "all" makes every one, as it should; "none"
+# skips them all, which is faster and will show wrong pictures where the game
+# needs a copy; "color" or "depth" makes only those of that kind.
+#ps5_edram_transfers = "all"
+
 # For performance work only, when a log is being recorded to find out what
 # limits the frame rate: every 30 s the log gets, for each busy thread, how
 # much of a processor core it used and where it spent the time. To find that
