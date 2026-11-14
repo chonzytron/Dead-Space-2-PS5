@@ -23,6 +23,11 @@
 # Set false if the game's speed or its motion seems wrong.
 #vsync_adaptive = true
 
+# Faster tracking of the graphics data the game rewrites every frame (moving
+# characters, effects). New and untested: set false if geometry flickers,
+# stretches or is left behind where it was a moment ago.
+#shared_memory_volatile_pages = true
+
 # A frames-a-second counter in the top right corner of the picture.
 #ps5_show_fps = false
 
