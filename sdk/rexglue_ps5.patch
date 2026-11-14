@@ -566,10 +566,49 @@ index 4d85a2b5..1438d9bf 100644
      GlobalWatchCallback callback;
      void* callback_context;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff481..058933f0 100644
+index 696ff481..a6ac8789 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -727,6 +727,25 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -143,6 +143,38 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
+                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+ 
++  // [ps5 port] What the GPU's time goes to, while the profiler runs
++  // (rex::ps5diag::ProfilerRunning): a timestamp wherever the kind of work
++  // being recorded changes, and every 30 s a log line with the milliseconds a
++  // frame each kind took ("ps5 gpu:"). The time from one timestamp to the next
++  // is the work between them finishing after the work before it did; the GPU
++  // overlaps neighbouring work a little, so the split is close, not exact.
++  enum class GpuPhase : uint8_t {
++    kDraw,         // the game's draws (and anything not below)
++    kTransfer,     // EDRAM contents copied between host render targets
++    kResolve,      // resolves (render target to memory) and resolve clears
++    kTextureLoad,  // guest texture data made into host textures
++    kUpload,       // guest memory copied to the GPU's copy of it
++    kSwap,         // the frame out to the screen
++    kCount,
++  };
++  void SetGpuPhase(GpuPhase phase);
++  // Sets a kind of work for as long as it lives, then the one before.
++  class GpuPhaseScope {
++   public:
++    GpuPhaseScope(VulkanCommandProcessor& command_processor, GpuPhase phase)
++        : command_processor_(command_processor), previous_(command_processor.gpu_phase_) {
++      command_processor_.SetGpuPhase(phase);
++    }
++    ~GpuPhaseScope() { command_processor_.SetGpuPhase(previous_); }
++    GpuPhaseScope(const GpuPhaseScope&) = delete;
++    GpuPhaseScope& operator=(const GpuPhaseScope&) = delete;
++
++   private:
++    VulkanCommandProcessor& command_processor_;
++    GpuPhase previous_;
++  };
++
+   // Returns the deferred drawing command list for the currently open
+   // submission.
+   DeferredCommandBuffer& deferred_command_buffer() {
+@@ -727,6 +759,43 @@ class VulkanCommandProcessor : public CommandProcessor {
    uint64_t scratch_buffer_last_usage_submission_ = 0;
    bool scratch_buffer_used_ = false;
  
@@ -582,8 +621,6 @@ index 696ff481..058933f0 100644
 +  void ShutdownGpuTimestamps();
 +  void ReadGpuTimestamps(uint64_t first_submission, uint64_t last_submission);
 +  VkQueryPool gpu_timestamp_pool_ = VK_NULL_HANDLE;
-+  PFN_vkCmdWriteTimestamp gpu_timestamp_write_ = nullptr;
-+  PFN_vkGetQueryPoolResults gpu_timestamp_results_ = nullptr;
 +  double gpu_timestamp_ns_per_tick_ = 0.0;
 +  uint64_t gpu_timestamp_mask_ = 0;
 +  uint64_t gpu_timestamp_one_second_ = 0;  // in ticks
@@ -592,9 +629,71 @@ index 696ff481..058933f0 100644
 +  // The submission each slot's two queries belong to (0: free).
 +  std::array<uint64_t, kGpuTimestampSlots> gpu_timestamp_slot_submission_{};
 +
++  // [ps5 port] GpuPhase timing: per submission a slot of queries, query 0 at
++  // its start, one at each change of the kind of work, and one at its end.
++  static constexpr uint32_t kGpuPhaseSlots = 64;
++  static constexpr uint32_t kGpuPhaseQueriesPerSlot = 1024;
++  void BeginGpuPhaseTiming();
++  void ReadGpuPhases(uint64_t first_submission, uint64_t last_submission);
++  void ReportGpuPhases();
++  VkQueryPool gpu_phase_pool_ = VK_NULL_HANDLE;
++  GpuPhase gpu_phase_ = GpuPhase::kDraw;
++  bool gpu_phase_timing_ = false;  // the open submission is timed
++  uint32_t gpu_phase_slot_ = 0;
++  uint32_t gpu_phase_query_count_ = 0;  // queries the open submission has
++  std::array<uint64_t, kGpuPhaseSlots> gpu_phase_slot_submission_{};  // 0: free
++  // Per slot, the kind of work from each query to the next.
++  std::array<std::vector<GpuPhase>, kGpuPhaseSlots> gpu_phase_slot_phases_;
++  std::array<double, size_t(GpuPhase::kCount)> gpu_phase_ns_{};
++  std::array<uint64_t, size_t(GpuPhase::kCount)> gpu_phase_entries_{};
++  std::array<uint64_t, 3> gpu_phase_draws_by_msaa_{};  // 1x, 2x, 4x
++  uint64_t gpu_phase_report_ms_ = 0, gpu_phase_report_swaps_ = 0;
++
    static constexpr uint32_t kMaxOcclusionQueries = 8192;
    VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
    VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a8485..95b5ada9 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -265,6 +265,16 @@ class DeferredCommandBuffer {
+   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
+   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+ 
++  // [ps5 port] (the GPU time of what is recorded: VulkanCommandProcessor::SetGpuPhase)
++  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
++                           uint32_t query) {
++    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
++        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
++    args.pipeline_stage = pipeline_stage;
++    args.query_pool = query_pool;
++    args.query = query;
++  }
++
+   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
+     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
+         WriteCommand(Command::kVkResetQueryPool, sizeof(ArgsVkResetQueryPool)));
+@@ -381,6 +391,7 @@ class DeferredCommandBuffer {
+     kVkSetStencilReference,
+     kVkSetStencilWriteMask,
+     kVkSetViewport,
++    kVkWriteTimestamp,
+   };
+ 
+   struct CommandHeader {
+@@ -520,6 +531,12 @@ class DeferredCommandBuffer {
+     uint32_t query;
+   };
+ 
++  struct ArgsVkWriteTimestamp {
++    VkPipelineStageFlagBits pipeline_stage;
++    VkQueryPool query_pool;
++    uint32_t query;
++  };
++
+   struct ArgsVkResetQueryPool {
+     VkQueryPool query_pool;
+     uint32_t first_query;
 diff --git a/include/rex/input/ps5/ps5_input_driver.h b/include/rex/input/ps5/ps5_input_driver.h
 new file mode 100644
 index 00000000..870db03b
@@ -748,10 +847,10 @@ index 00000000..85c3c3ca
 +#endif  // __PROSPERO__
 diff --git a/include/rex/ps5_diag.h b/include/rex/ps5_diag.h
 new file mode 100644
-index 00000000..352e31d7
+index 00000000..fca0e473
 --- /dev/null
 +++ b/include/rex/ps5_diag.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +/**
 + * @file        rex/ps5_diag.h
@@ -812,6 +911,8 @@ index 00000000..352e31d7
 +// found at most ("ps5 prof:" lines, addresses as in the stack lines;
 +// ps5/tools/ps5_symbolize.py names them). Costs a few percent while it runs.
 +void StartProfiler(int report_seconds);
++// Whether StartProfiler was called (others then measure more, too).
++bool ProfilerRunning();
 +
 +// A host fault no handler took (a crash in some thread): the first one is
 +// written to the end of the log file with the thread's return addresses
@@ -834,6 +935,7 @@ index 00000000..352e31d7
 +#else
 +inline void Add(Counter) {}
 +inline void AddN(Counter, uint64_t) {}
++inline bool ProfilerRunning() { return false; }
 +#endif
 +
 +}  // namespace rex::ps5diag
@@ -1183,6 +1285,26 @@ index 00000000..61d85885
 +
 +}  // namespace ui
 +}  // namespace rex
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a2..52cdebef 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -28,6 +28,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdResetQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetBlendConstants)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetScissor)
++XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilCompareMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilReference)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilWriteMask)
+@@ -71,6 +72,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
+ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
++XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
 diff --git a/include/rex/ui/vulkan/functions/instance_khr_display.inc b/include/rex/ui/vulkan/functions/instance_khr_display.inc
 new file mode 100644
 index 00000000..4df17f05
@@ -2228,10 +2350,10 @@ index d639924c..7f325c0c 100644
  }  // namespace rex::thread
 diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
 new file mode 100644
-index 00000000..90236d6c
+index 00000000..c19254b6
 --- /dev/null
 +++ b/src/core/ps5_diag.cpp
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,388 @@
 +// [ps5 port] see rex/ps5_diag.h
 +#include <rex/ps5_diag.h>
 +
@@ -2545,9 +2667,16 @@ index 00000000..90236d6c
 +
 +}  // namespace
 +
++namespace {
++std::atomic<bool> profiler_running{false};
++}  // namespace
++
++bool ProfilerRunning() { return profiler_running.load(std::memory_order_relaxed); }
++
 +void StartProfiler(int report_seconds) {
 +  static std::once_flag once;
 +  std::call_once(once, [report_seconds] {
++    profiler_running.store(true, std::memory_order_relaxed);
 +    InstallSampleHandler();
 +    std::thread(ProfilerThread, report_seconds < 5 ? 5 : report_seconds).detach();
 +  });
@@ -3978,7 +4107,7 @@ index ec0df7c8..43f00e7b 100644
      uint64_t invalidate_bits = UINT64_MAX;
      if (i == block_first) {
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 6207c1c6..fe5bcfdd 100644
+index 6207c1c6..0b748410 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -4021,7 +4150,34 @@ index 6207c1c6..fe5bcfdd 100644
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
-@@ -4757,6 +4762,110 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
+@@ -2292,6 +2297,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
+     return;
+   }
++  GpuPhaseScope gpu_phase(*this, GpuPhase::kSwap);
+ 
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+@@ -3644,6 +3650,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
++  if (gpu_phase_timing_) {
++    ++gpu_phase_draws_by_msaa_[std::min<size_t>(
++        size_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples), 2)];
++  }
+ 
+   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
+ 
+@@ -4416,6 +4426,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  GpuPhaseScope gpu_phase(*this, GpuPhase::kResolve);
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+@@ -4757,6 +4768,229 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
    }
  }
  
@@ -4036,11 +4192,6 @@ index 6207c1c6..fe5bcfdd 100644
 +  const auto& ifn = vulkan_device->vulkan_instance()->functions();
 +  VkDevice device = vulkan_device->device();
 +
-+  // (loaded here, not with the device's functions: the game runs without them)
-+  gpu_timestamp_write_ =
-+      PFN_vkCmdWriteTimestamp(ifn.vkGetDeviceProcAddr(device, "vkCmdWriteTimestamp"));
-+  gpu_timestamp_results_ =
-+      PFN_vkGetQueryPoolResults(ifn.vkGetDeviceProcAddr(device, "vkGetQueryPoolResults"));
 +  VkPhysicalDeviceProperties properties;
 +  ifn.vkGetPhysicalDeviceProperties(vulkan_device->physical_device(), &properties);
 +  uint32_t family_count = 0;
@@ -4051,8 +4202,7 @@ index 6207c1c6..fe5bcfdd 100644
 +                                               families.data());
 +  const uint32_t family = vulkan_device->queue_family_graphics_compute();
 +  const uint32_t valid_bits = family < family_count ? families[family].timestampValidBits : 0;
-+  if (!gpu_timestamp_write_ || !gpu_timestamp_results_ || !valid_bits ||
-+      !(properties.limits.timestampPeriod > 0.0f)) {
++  if (!valid_bits || !(properties.limits.timestampPeriod > 0.0f)) {
 +    REXGPU_INFO("GPU time isn't measured: no timestamps on the graphics queue");
 +    return;
 +  }
@@ -4070,17 +4220,141 @@ index 6207c1c6..fe5bcfdd 100644
 +  gpu_timestamp_one_second_ = uint64_t(1e9 / gpu_timestamp_ns_per_tick_);
 +  REXGPU_INFO("GPU time is measured ({} ns a tick, {} bits)", gpu_timestamp_ns_per_tick_,
 +              valid_bits);
++  // (what the time goes to, while the profiler runs)
++  pool_info.queryCount = kGpuPhaseSlots * kGpuPhaseQueriesPerSlot;
++  if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_phase_pool_) != VK_SUCCESS) {
++    gpu_phase_pool_ = VK_NULL_HANDLE;
++  }
++  gpu_phase_slot_submission_.fill(0);
 +#endif
 +}
 +
 +void VulkanCommandProcessor::ShutdownGpuTimestamps() {
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
 +  if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
-+    const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
 +    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), gpu_timestamp_pool_,
 +                                                  nullptr);
 +  }
++  if (gpu_phase_pool_ != VK_NULL_HANDLE) {
++    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), gpu_phase_pool_,
++                                                  nullptr);
++  }
 +  gpu_timestamp_pool_ = VK_NULL_HANDLE;
++  gpu_phase_pool_ = VK_NULL_HANDLE;
 +  gpu_timestamp_slot_submission_.fill(0);
++  gpu_phase_slot_submission_.fill(0);
++  gpu_phase_timing_ = false;
++}
++
++void VulkanCommandProcessor::BeginGpuPhaseTiming() {
++  gpu_phase_timing_ = false;
++  if (gpu_phase_pool_ == VK_NULL_HANDLE || !rex::ps5diag::ProfilerRunning()) {
++    return;
++  }
++  const uint64_t submission = GetCurrentSubmission();
++  const uint32_t slot = uint32_t(submission % kGpuPhaseSlots);
++  if (gpu_phase_slot_submission_[slot]) {
++    return;  // (an earlier submission's, not read yet)
++  }
++  gpu_phase_timing_ = true;
++  gpu_phase_slot_ = slot;
++  gpu_phase_query_count_ = 1;  // (query 0: written when the submission starts)
++  std::vector<GpuPhase>& phases = gpu_phase_slot_phases_[slot];
++  phases.clear();
++  phases.push_back(gpu_phase_);
++}
++
++void VulkanCommandProcessor::SetGpuPhase(GpuPhase phase) {
++  if (phase == gpu_phase_) {
++    return;
++  }
++  gpu_phase_ = phase;
++  // (one query is kept for the end of the submission)
++  if (!gpu_phase_timing_ || !submission_open_ ||
++      gpu_phase_query_count_ + 1 >= kGpuPhaseQueriesPerSlot) {
++    return;
++  }
++  deferred_command_buffer_.CmdVkWriteTimestamp(
++      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_phase_pool_,
++      gpu_phase_slot_ * kGpuPhaseQueriesPerSlot + gpu_phase_query_count_);
++  ++gpu_phase_query_count_;
++  gpu_phase_slot_phases_[gpu_phase_slot_].push_back(phase);
++  ++gpu_phase_entries_[size_t(phase)];
++}
++
++void VulkanCommandProcessor::ReadGpuPhases(uint64_t first_submission, uint64_t last_submission) {
++  if (gpu_phase_pool_ == VK_NULL_HANDLE) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  bool any = false;
++  std::vector<uint64_t> ticks;
++  for (uint64_t submission = first_submission; submission <= last_submission; ++submission) {
++    const uint32_t slot = uint32_t(submission % kGpuPhaseSlots);
++    if (gpu_phase_slot_submission_[slot] != submission) {
++      continue;
++    }
++    gpu_phase_slot_submission_[slot] = 0;
++    const std::vector<GpuPhase>& phases = gpu_phase_slot_phases_[slot];
++    const uint32_t query_count = uint32_t(phases.size()) + 1;
++    ticks.resize(query_count);
++    if (vulkan_device->functions().vkGetQueryPoolResults(
++            vulkan_device->device(), gpu_phase_pool_, slot * kGpuPhaseQueriesPerSlot,
++            query_count, sizeof(uint64_t) * query_count, ticks.data(), sizeof(uint64_t),
++            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++      continue;
++    }
++    for (size_t i = 0; i < phases.size(); ++i) {
++      const uint64_t from = ticks[i] & gpu_timestamp_mask_;
++      const uint64_t to = ticks[i + 1] & gpu_timestamp_mask_;
++      if (to < from || to - from > gpu_timestamp_one_second_) {
++        continue;
++      }
++      gpu_phase_ns_[size_t(phases[i])] += double(to - from) * gpu_timestamp_ns_per_tick_;
++    }
++    any = true;
++  }
++  if (any) {
++    ReportGpuPhases();
++  }
++}
++
++void VulkanCommandProcessor::ReportGpuPhases() {
++#if REX_PLATFORM_PS5
++  const uint64_t now_ms = rex::ps5diag::NowMs();
++  if (!gpu_phase_report_ms_) {
++    gpu_phase_report_ms_ = now_ms;
++    gpu_phase_report_swaps_ = rex::ps5diag::Get(rex::ps5diag::kSwaps);
++    return;
++  }
++  if (now_ms - gpu_phase_report_ms_ < 30000) {
++    return;
++  }
++  const uint64_t swaps = rex::ps5diag::Get(rex::ps5diag::kSwaps);
++  const double frames = double(std::max<uint64_t>(swaps - gpu_phase_report_swaps_, 1));
++  const double seconds = double(now_ms - gpu_phase_report_ms_) / 1000.0;
++  auto ms = [&](GpuPhase phase) { return gpu_phase_ns_[size_t(phase)] / 1e6 / frames; };
++  auto per_frame = [&](GpuPhase phase) { return double(gpu_phase_entries_[size_t(phase)]) / frames; };
++  const double draws = double(std::max<uint64_t>(
++      gpu_phase_draws_by_msaa_[0] + gpu_phase_draws_by_msaa_[1] + gpu_phase_draws_by_msaa_[2], 1));
++  REXGPU_INFO(
++      "ps5 gpu: {:.1f} s, {:.1f} frames/s. A frame's GPU time: draws {:.1f} ms, EDRAM transfers "
++      "{:.1f} ms ({:.0f} a frame), resolves {:.1f} ms ({:.0f} a frame), texture loads {:.1f} ms "
++      "({:.0f} a frame), uploads {:.1f} ms ({:.0f} a frame), frame out {:.1f} ms. Draws {:.0f} a "
++      "frame, by MSAA: 1x {:.0f}%, 2x {:.0f}%, 4x {:.0f}%",
++      seconds, frames / seconds, ms(GpuPhase::kDraw), ms(GpuPhase::kTransfer),
++      per_frame(GpuPhase::kTransfer), ms(GpuPhase::kResolve), per_frame(GpuPhase::kResolve),
++      ms(GpuPhase::kTextureLoad), per_frame(GpuPhase::kTextureLoad), ms(GpuPhase::kUpload),
++      per_frame(GpuPhase::kUpload), ms(GpuPhase::kSwap), draws / frames,
++      100.0 * double(gpu_phase_draws_by_msaa_[0]) / draws,
++      100.0 * double(gpu_phase_draws_by_msaa_[1]) / draws,
++      100.0 * double(gpu_phase_draws_by_msaa_[2]) / draws);
++  gpu_phase_ns_.fill(0.0);
++  gpu_phase_entries_.fill(0);
++  gpu_phase_draws_by_msaa_.fill(0);
++  gpu_phase_report_ms_ = now_ms;
++  gpu_phase_report_swaps_ = swaps;
++#endif
 +}
 +
 +void VulkanCommandProcessor::ReadGpuTimestamps(uint64_t first_submission,
@@ -4098,8 +4372,9 @@ index 6207c1c6..fe5bcfdd 100644
 +    gpu_timestamp_slot_submission_[slot] = 0;
 +    uint64_t ticks[2];
 +    // (its fence is signalled: the results are there, no waiting)
-+    if (gpu_timestamp_results_(device, gpu_timestamp_pool_, slot * 2, 2, sizeof(ticks), ticks,
-+                               sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++    if (GetVulkanDevice()->functions().vkGetQueryPoolResults(
++            device, gpu_timestamp_pool_, slot * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t),
++            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
 +      continue;
 +    }
 +    uint64_t start = ticks[0] & gpu_timestamp_mask_;
@@ -4132,7 +4407,7 @@ index 6207c1c6..fe5bcfdd 100644
  bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
    active_occlusion_query_ = {};
    occlusion_query_cursor_ = 0;
-@@ -4997,9 +5106,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -4997,9 +5231,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
      // defined by vkQueueSubmit additionally include in the first
      // synchronization scope all commands that occur earlier in submission
      // order."
@@ -4151,15 +4426,24 @@ index 6207c1c6..fe5bcfdd 100644
      if (wait_result == VK_SUCCESS) {
        fences_awaited += await_submission - submission_completed_;
      } else {
-@@ -5041,6 +5159,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5041,6 +5284,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                        submissions_in_flight_fences_awaited_end);
    submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                        submissions_in_flight_fences_awaited_end);
 +  ReadGpuTimestamps(submission_completed_ + 1, submission_completed_ + fences_awaited);
++  ReadGpuPhases(submission_completed_ + 1, submission_completed_ + fences_awaited);
    submission_completed_ += fences_awaited;
  
    // Reclaim semaphores.
-@@ -5412,7 +5531,22 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5163,6 +5408,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     // the end of the submission (when async pipeline object creation requests
+     // are fulfilled).
+     deferred_command_buffer_.Reset();
++    BeginGpuPhaseTiming();
+ 
+     // Reset cached state of the command buffer.
+     dynamic_viewport_update_needed_ = true;
+@@ -5412,7 +5658,37 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -4171,27 +4455,107 @@ index 6207c1c6..fe5bcfdd 100644
 +                             gpu_timestamp_slot_submission_[timestamp_slot] == 0;
 +    if (timestamped) {
 +      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_timestamp_pool_, timestamp_slot * 2, 2);
-+      gpu_timestamp_write_(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-+                           gpu_timestamp_pool_, timestamp_slot * 2);
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              gpu_timestamp_pool_, timestamp_slot * 2);
++    }
++    // (the queries of the kinds of work: reset before the deferred commands
++    // write them, the first at the start, the last at the end)
++    const uint32_t phase_first_query = gpu_phase_slot_ * kGpuPhaseQueriesPerSlot;
++    if (gpu_phase_timing_) {
++      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_phase_pool_, phase_first_query,
++                              gpu_phase_query_count_ + 1);
++      // (bottom of the pipe: when the submissions before it are done, so their
++      // work isn't counted in this one's first interval)
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              gpu_phase_pool_, phase_first_query);
 +    }
      deferred_command_buffer_.Execute(command_buffer.buffer);
++    if (gpu_phase_timing_) {
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              gpu_phase_pool_, phase_first_query + gpu_phase_query_count_);
++    }
 +    if (timestamped) {
-+      gpu_timestamp_write_(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+                           gpu_timestamp_pool_, timestamp_slot * 2 + 1);
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              gpu_timestamp_pool_, timestamp_slot * 2 + 1);
 +    }
      if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
        REXGPU_ERROR("Failed to end a Vulkan command buffer");
        return false;
-@@ -5457,6 +5591,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5457,6 +5733,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        return false;
      }
      uint64_t submission_current = GetCurrentSubmission();
 +    if (timestamped) {
 +      gpu_timestamp_slot_submission_[timestamp_slot] = submission_current;
 +    }
++    if (gpu_phase_timing_) {
++      gpu_phase_slot_submission_[gpu_phase_slot_] = submission_current;
++      gpu_phase_timing_ = false;
++    }
      current_submission_wait_stage_masks_.clear();
      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033b..51215f22 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -314,6 +314,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
+       } break;
+ 
++      case Command::kVkWriteTimestamp: {
++        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
++        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool, args.query);
++      } break;
++
+       default:
+         assert_unhandled_case(header.command);
+         break;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f062..40707fb0 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1397,8 +1397,12 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
+ 
+-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+-                                       depth_and_color_render_targets, last_update_transfers());
++      {
++        VulkanCommandProcessor::GpuPhaseScope gpu_phase(
++            command_processor_, VulkanCommandProcessor::GpuPhase::kTransfer);
++        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                         depth_and_color_render_targets, last_update_transfers());
++      }
+ 
+       if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 962ba33e..58802ded 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -273,6 +273,8 @@ bool VulkanSharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  VulkanCommandProcessor::GpuPhaseScope gpu_phase(command_processor_,
++                                                 VulkanCommandProcessor::GpuPhase::kUpload);
+   // upload_page_ranges are sorted, use them to determine the range for the
+   // ordering barrier.
+   Use(Usage::kTransferDestination,
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940d..a45141f9 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1215,6 +1215,8 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+ 
+ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                                bool load_mips) {
++  VulkanCommandProcessor::GpuPhaseScope gpu_phase(command_processor_,
++                                                 VulkanCommandProcessor::GpuPhase::kTextureLoad);
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
+ 
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
 index 3ea35358..ecc92087 100644
 --- a/src/input/CMakeLists.txt
