@@ -73,8 +73,27 @@ The pictures differ from each other no more than two runs of `game` do (on the
 animated character and the fog). Walking out of the room into the corridor (a
 script of stick pushes), the same: no light missing, cut off or spilling, 54.3
 frames a second with `game` (EDRAM transfers 8.8 ms, 25 a frame) and 60 (the
-cap) with `full` (4.0 ms, 8). Still to see: a console at 4K, and the rest of the
-game.
+cap) with `full` (4.0 ms, 8).
+
+On a PS5 at native 4K (`resolution_scale = 3`, profiling on), the room with the
+hacking panel after the first save, the worst place in the stretch played, 30 s
+windows:
+
+| | `game` (ds2_014) | `full` (ds2_015) |
+|---|---|---|
+| frames a second | 21.5-21.9 | 33.1 (40-46 in the windows around it) |
+| culling sections a frame | 42.5 | 48.3, all at 1x |
+| EDRAM transfers | 24.5 ms, 103 a frame | 7.4 ms, 22 a frame |
+| the game's draws | 9.2 ms (1665) | 9.3 ms (2036) |
+| texture loads + resolves | 7.3 ms | 8.2 ms |
+
+In `game`, 85 of the 103 transfers were the main depth buffer between 1x and 4x
+at tile 0 (43.6 and 41.8 a frame): the culling. With `full` the lighting looked
+right in the room, the corridors and the fights after it, and the quieter parts
+held 60 for minutes. What is left in the heavy room is about 25 ms of GPU work:
+draws 9.3, transfers 7.4 (the other 4x sections: shadow attenuation and low
+resolution effects, about 1-2 each a frame, each a copy both ways), texture
+loads 4.8, resolves 3.4.
 
 ## A frame, as recorded
 
