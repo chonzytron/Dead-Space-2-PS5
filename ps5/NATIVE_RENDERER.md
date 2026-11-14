@@ -70,7 +70,11 @@ save-station room of a save (720p, Radeon 760M), 30 s each:
 | the game's draws | 6.7 ms | 6.3 ms |
 
 The pictures differ from each other no more than two runs of `game` do (on the
-animated character and the fog). Still to see: other scenes, and a console at 4K.
+animated character and the fog). Walking out of the room into the corridor (a
+script of stick pushes), the same: no light missing, cut off or spilling, 54.3
+frames a second with `game` (EDRAM transfers 8.8 ms, 25 a frame) and 60 (the
+cap) with `full` (4.0 ms, 8). Still to see: a console at 4K, and the rest of the
+game.
 
 ## A frame, as recorded
 
