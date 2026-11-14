@@ -61,6 +61,12 @@
 # needs a copy; "color" or "depth" makes only those of that kind.
 #ps5_edram_transfers = "all"
 
+# For the native renderer's work: 1 records the game's Direct3D calls. Every
+# 30 s a line in the log, every 60 s one whole frame call by call in the logs
+# folder (d3d_frame_<n>.txt), and each shader the game creates
+# (d3d_shaders.txt). A little slower while a frame is recorded.
+#ps5_d3d_trace = 0
+
 # For performance work only, when a log is being recorded to find out what
 # limits the frame rate: every 30 s the log gets, for each busy thread, how
 # much of a processor core it used and where it spent the time. To find that
