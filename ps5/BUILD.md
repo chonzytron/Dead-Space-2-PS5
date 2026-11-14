@@ -145,6 +145,7 @@ For tests (in `ds2.toml`, on Linux and on the PS5):
 | `ps5/src/ds2_ps5_lowres.cpp` | the game's 4x MSAA "low resolution" sections counted, and the lighting's culling kept at 1x (`ps5_lowres_culling`) |
 | `ps5/src/ds2_ps5_capture.h`, `ds2_ps5_script.cpp` | for tests: pictures in the logs folder (`ps5_capture`), buttons pressed by themselves (`ps5_input_script`) |
 | `ps5/src/ds2_ps5_linux.cpp`, `ps5/tools/linux_test.sh` | the Linux test build |
+| `ps5/tools/d3d_frame_summary.py` | a recorded frame (`ps5_d3d_trace`) as its passes: render targets, draws, resolves |
 | `ps5/src/ds2_ps5_io.h` | unpacking past the PS5's file cache (`ps5/tests/ps5_io_test.cpp` runs it on Linux) |
 | `ps5/src/ds2_ps5_pch.h` | the recompiled code's precompiled header with the PS5's memory offset |
 | `ps5/tools/` | SDK fetch, link and packaging, log symbolizer |

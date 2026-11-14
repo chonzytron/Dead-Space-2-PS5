@@ -72,6 +72,25 @@ save-station room of a save (720p, Radeon 760M), 30 s each:
 The pictures differ from each other no more than two runs of `game` do (on the
 animated character and the fog). Still to see: other scenes, and a console at 4K.
 
+## A frame, as recorded
+
+`ps5/tools/d3d_frame_summary.py logs/d3d_frame_<n>.txt` turns a recorded frame
+into its passes. The save-station room on the Linux test build (frame 5917, 4208
+calls, 602 draws, 51 passes):
+
+| Calls | Colour / depth | What |
+|---|---|---|
+| 96-1030 | 1280x720 / 1280x720 D24S8 | the scene: 245 draws; colour and depth resolved to textures |
+| 1050-2129 | alternately 640x360 4x over the same memory, and 1280x720 | the deferred lighting: 23 times one stencil draw at 4x (the culling) and one light at 1x |
+| 2149-2156 | 80 wide, no depth | a small pass (luminance?), resolved |
+| 2194-4184 | the second 1280x720 colour / the same depth | 306 draws (forward, effects, post), resolved for the screen |
+
+The game keeps a few surface structures and rewrites them in place: the 4x view
+is the 1x surface's structure with a new size word (`0A020280` for `14000500`).
+With `ps5_lowres_culling = "full"` the lighting loop is all at 1x. The 8
+transfers a frame left are other 1x/4x switches (once or twice a frame each) and a
+small float target aliasing the depth.
+
 ## Testing on a PC
 
 `ps5/tools/linux_test.sh` (ps5/BUILD.md, "On Linux") builds the PS5 program for
@@ -91,6 +110,12 @@ stays the default until the native one is better everywhere.
    Direct3D calls, frame by frame, and the shaders it creates. From these: the
    argument lists and structure layouts as they really are, and how a frame is
    built (passes, render targets, resolves, tiling, the depth MSAA trick).
+   Done on the Linux test build for one room ("A frame, as recorded"); more
+   scenes, and the console's, to come.
+0b. **The depth MSAA trick as what it means**, inside the emulated renderer
+   first, since it is most of the cost and needs no new renderer: the lighting's
+   culling at 1x (`ps5_lowres_culling = "full"`, measured above). Next: the
+   remaining 4x sections, then the default once a console agrees.
 1. **A native frame beside the emulated one**: the same calls drawn natively
    into an image of their own, shown instead of the emulated picture by a
    setting, with Xenia's shader translator and texture code reused for
