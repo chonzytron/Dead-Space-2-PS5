@@ -4580,6 +4580,52 @@ index ec0df7c8..25ca96ba 100644
    for (uint32_t i = block_first; i <= block_last; ++i) {
      uint64_t invalidate_bits = UINT64_MAX;
      if (i == block_first) {
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index 3027dc8e..de3d2cd3 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cfloat>
++#include <cmath>
+ #include <cstdint>
+ 
+ #include <rex/assert.h>
+@@ -250,6 +251,17 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
+          8;
+ }
+ 
++// [ps5 port] A draw with clipping and the viewport transform off (positions
++// already in pixels: full-screen quads, for instance) and no scissor has nothing
++// to bound it but its vertices; when those can't be run on the CPU, it is taken
++// to reach 8192 pixels down, and the render targets it uses then claim the EDRAM
++// of the ones placed after them (EDRAM transfers both ways each time, at the
++// full size). Direct3D 9 still sets the viewport registers to the surface's
++// viewport for such draws: with this, they bound it.
++REXCVAR_DEFINE_BOOL(ps5_draw_extent_from_viewport, false, "PS5",
++                    "Bound the height of unclipped draws without a scissor by the viewport the "
++                    "game set (fewer EDRAM transfers)");
++
+ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
+                                            const Shader& vertex_shader) {
+   SCOPE_profile_cpu_f("gpu");
+@@ -297,6 +309,15 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
+         max_y = std::min(max_y, EstimateVertexMaxY(vertex_shader));
+       }
+     }
++    // [ps5 port] see ps5_draw_extent_from_viewport
++    if (REXCVAR_GET(ps5_draw_extent_from_viewport)) {
++      const float viewport_bottom = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET)) +
++                                    std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) +
++                                    float(std::max(window_y_offset, int32_t(0)));
++      if (viewport_bottom >= 1.0f && viewport_bottom < float(max_y)) {
++        max_y = uint32_t(std::ceil(viewport_bottom));
++      }
++    }
+   } else {
+     // Viewport. Though the Xenos itself doesn't have an implicit viewport
+     // scissor (it's set by Direct3D 9 when a viewport is used), on hosts, it
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 6207c1c6..672da61a 100644
 --- a/src/graphics/vulkan/command_processor.cpp

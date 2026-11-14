@@ -193,6 +193,27 @@ What is left of those is the two copies themselves (into the forwarding image
 at the resolve, into the texture at the read-back). Next: one pass, straight
 into the texture.
 
+## Render targets the size they are (ps5_draw_extent_from_viewport)
+
+The EDRAM transfers left after the low-res fixes (6.5 ms a frame at
+`resolution_scale = 2` on the Linux test build, 3.7-3.9 ms in the heavy room at
+4K on the PS5) were the depth buffer at tile 0 and the colour target at tile 720
+trading ownership of each other's EDRAM, 37% of their tiles each time. They
+don't overlap: a 1280x720 depth buffer is exactly 720 tiles. The emulator decides
+how far down a draw reaches from its scissor, its viewport, or by running its
+vertex shader on the CPU; the game's full-screen quads have no scissor (8192),
+clipping and the viewport transform off (positions already in pixels), and a
+vertex setup it can't run, so they are taken to reach 2048 rows and the depth
+buffer claims the colour target's EDRAM. Direct3D still sets the viewport
+registers to the surface (0 to 720) for them. `ps5_draw_extent_from_viewport`
+bounds such draws by it (SDK `draw_extent_estimator.cpp`).
+
+Linux test build, `resolution_scale = 2`, with `ps5_resolve_forward = 2`:
+transfers 6.5 ms (5 a frame) -> 0.0 (none), 28.2 -> 33.9 frames a second in the
+corridor, 35.8 -> 46.1 in the save room. The pictures (menus, inventory, pause
+menu, save station, corridor) unchanged. Off by default until a console has run
+it.
+
 ## A frame, as recorded
 
 `ps5/tools/d3d_frame_summary.py logs/d3d_frame_<n>.txt` turns a recorded frame

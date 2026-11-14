@@ -101,6 +101,13 @@
 # old frame or looks wrong somewhere with it on.
 #ps5_resolve_forward = 0
 
+# Experiment: the emulator takes the game's full-screen drawing to reach far
+# below the picture, and then copies the depth buffer and the picture over
+# each other every time (the "EDRAM transfers" left). true bounds it by the
+# viewport the game set. Say if the bottom of the picture shows something old
+# or wrong with it on.
+#ps5_draw_extent_from_viewport = false
+
 # For performance work only, when a log is being recorded to find out what
 # limits the frame rate: every 30 s the log gets, for each busy thread, how
 # much of a processor core it used and where it spent the time. To find that
