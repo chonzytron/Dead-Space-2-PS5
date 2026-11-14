@@ -445,7 +445,7 @@ index d26cd4fb..fffad831 100644
                                          bool invalidated_by_gpu);
  
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 4d85a2b5..7fa8be4a 100644
+index 4d85a2b5..1438d9bf 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -10,7 +10,9 @@
@@ -476,7 +476,7 @@ index 4d85a2b5..7fa8be4a 100644
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu);
    typedef void* WatchHandle;
-@@ -179,6 +181,77 @@ class SharedMemory {
+@@ -179,6 +181,82 @@ class SharedMemory {
    static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
        void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
  
@@ -491,35 +491,40 @@ index 4d85a2b5..7fa8be4a 100644
 +  // of its time and the game's main thread for an eighth.
 +  //
 +  // So a page that keeps faulting stops being protected. Whether it changed is
-+  // found out when a draw asks for it instead, by comparing it with a copy kept
-+  // of what was last uploaded (16 KB: a microsecond or two). What a draw gets
-+  // is the same either way: what is in the game's memory when the draw is made.
++  // found out when a draw asks for it instead, from a 64-bit hash of it kept
++  // from the last upload (16 KB: under a microsecond; the first version kept a
++  // copy and compared, which read twice the memory and took two). What a draw
++  // gets is the same either way: what is in the game's memory when the draw is
++  // made.
 +  //
-+  // A compare costs every time the page is asked for, where a protected page
++  // A look costs every time the page is asked for, where a protected page
 +  // costs nothing until it is written. So a page asked for many times in a row
 +  // without having changed is protected again; having been volatile once, its
 +  // next write fault makes it volatile at once. The worst case is then what it
-+  // was before, plus a few compares.
++  // was before, plus those looks. How many: a fault and the protecting that
++  // follows cost about as much as 130 looks, and giving up at the break-even
++  // is the most that can be had without knowing what comes (at 16, a console
++  // had 33 pages a frame going round).
 +  //
 +  // Only pages nothing else relies on being told about: one a texture watches,
 +  // or one the GPU wrote, is protected as before.
 +  static constexpr uint8_t kVolatileFaultCount = 3;      // write faults, each within...
 +  static constexpr uint64_t kVolatileFaultGapMs = 2000;  // ...this long of the one before
-+  static constexpr uint32_t kVolatileQuietCompares = 16; // unchanged in a row: protected again
-+  static constexpr uint32_t kVolatileMaxPages = 4096;    // (64 MB of copies with 16 KB pages)
++  static constexpr uint32_t kVolatileQuietCompares = 128; // unchanged in a row: protected again
++  static constexpr uint32_t kVolatileMaxPages = 16384;
 +  struct VolatilePage {
 +    // In the global critical region:
 +    uint64_t fault_ms = 0;  // the last write fault
 +    uint8_t faults = 0;     // write faults in a row
 +    bool sticky = false;    // has been volatile: the next fault makes it so again
-+    // Goes up whenever the page becomes volatile or stops being: a copy made
++    // Goes up whenever the page becomes volatile or stops being: a hash kept
 +    // under another number is of no use. (Written in the global critical
 +    // region, read by the command processor thread outside it.)
 +    std::atomic<uint32_t> epoch{0};
 +    // The command processor thread's:
-+    uint8_t* shadow = nullptr;  // what was last uploaded...
-+    uint32_t shadow_epoch = 0;  // ...when `epoch` and...
-+    uint32_t shadow_generation = 0;  // ...volatile_generation_ were these
++    uint64_t hash = 0;             // of what was last uploaded...
++    uint32_t hash_epoch = 0;       // ...when `epoch` and...
++    uint32_t hash_generation = 0;  // ...volatile_generation_ were these (0: no hash)
 +    uint32_t quiet_compares = 0;
 +  };
 +  static uint64_t VolatileNowMs();
@@ -530,9 +535,10 @@ index 4d85a2b5..7fa8be4a 100644
 +  // Both in the global critical region. True if the page's state changed.
 +  bool MakePageVolatile(uint32_t page);
 +  bool ClearPageVolatile(uint32_t page);
-+  // Whether the copy kept of a volatile page is what is in guest memory now
-+  // (command processor thread).
-+  bool VolatilePageUnchanged(uint32_t page) const;
++  // The hash of a page of guest memory as it is now.
++  uint64_t HashGuestPage(uint32_t page) const;
++  // Whether `hash` is the one kept for a volatile page (command processor thread).
++  bool IsVolatilePageHash(uint32_t page, uint64_t hash) const;
 +  // Takes out of upload_ranges_ the volatile pages that are what was uploaded
 +  // last time (command processor thread, outside the global critical region).
 +  void FilterVolatileUploadRanges();
@@ -541,11 +547,10 @@ index 4d85a2b5..7fa8be4a 100644
 +  std::unique_ptr<std::atomic<uint64_t>[]> system_page_flags_volatile_;
 +  std::unique_ptr<VolatilePage[]> volatile_pages_;
 +  std::atomic<uint32_t> volatile_page_count_{0};
-+  // Goes up when every page is invalidated: no copy says anything after that.
-+  std::atomic<uint32_t> volatile_generation_{0};
-+  // The command processor thread's: the pages that have a copy, the filtered
-+  // ranges, and what the log line says.
-+  std::vector<uint32_t> volatile_shadow_pages_;
++  // Goes up when every page is invalidated: no hash says anything after that.
++  std::atomic<uint32_t> volatile_generation_{1};
++  // The command processor thread's: the filtered ranges, and what the log
++  // line says.
 +  std::vector<std::pair<uint32_t, uint32_t>> volatile_filtered_ranges_;
 +  uint64_t volatile_stats_ms_ = 0, volatile_compares_ = 0, volatile_changed_ = 0;
 +  uint64_t volatile_quieted_ = 0;
@@ -2183,10 +2188,10 @@ index d639924c..7f325c0c 100644
  }  // namespace rex::thread
 diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
 new file mode 100644
-index 00000000..8605b8f4
+index 00000000..2f011905
 --- /dev/null
 +++ b/src/core/ps5_diag.cpp
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,377 @@
 +// [ps5 port] see rex/ps5_diag.h
 +#include <rex/ps5_diag.h>
 +
@@ -2418,7 +2423,10 @@ index 00000000..8605b8f4
 +
 +void ProfilerThread(int report_seconds) {
 +  constexpr uint64_t kOutside = 1ull << 63;
-+  constexpr size_t kTop = 14, kTopBusy = 40;  // (more for a thread that used half a core)
++  constexpr size_t kTop = 14, kTopBusy = 150;  // (more for a thread that used half a core)
++  // Places 16 bytes apart are one place: a hot loop is a few of these, not
++  // dozens of instructions each with its own count.
++  constexpr uint64_t kPlaceMask = ~uint64_t(15);
 +  std::vector<ProfThread> prof(kThreads);
 +  uint64_t report_at = NowMs() + uint64_t(report_seconds) * 1000, window_start = NowMs();
 +  uint64_t swaps_at_report = Get(kSwaps);
@@ -2447,7 +2455,7 @@ index 00000000..8605b8f4
 +      }
 +      ++t.samples;
 +      if (InProgram(rip)) {
-+        ++t.places[uint64_t(rip - Anchor() + 0x10000000)];
++        ++t.places[uint64_t(rip - Anchor() + 0x10000000) & kPlaceMask];
 +      } else {
 +        ++t.outside;
 +        ++t.places[kOutside | (caller ? uint64_t(caller - Anchor() + 0x10000000) : 0)];
@@ -3568,10 +3576,10 @@ index 76f5600c..989fc100 100644
    assert_true(IsDrawResolutionScaled());
    if (invalidated_by_gpu) {
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index ec0df7c8..5b4cdb16 100644
+index ec0df7c8..43f00e7b 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
-@@ -15,10 +15,25 @@
+@@ -15,10 +15,27 @@
  
  #include <rex/assert.h>
  #include <rex/bit.h>
@@ -3583,6 +3591,8 @@ index ec0df7c8..5b4cdb16 100644
  #include <rex/math.h>
  #include <rex/memory.h>
 +#include <rex/platform.h>
++
++#include <xxhash.h>
 +
 +// [ps5 port] rex/graphics/shared_memory.h, "Volatile pages".
 +#if REX_PLATFORM_PS5
@@ -3597,7 +3607,7 @@ index ec0df7c8..5b4cdb16 100644
  
  namespace rex::graphics {
  
-@@ -34,6 +49,19 @@ void SharedMemory::InitializeCommon() {
+@@ -34,6 +51,19 @@ void SharedMemory::InitializeCommon() {
    num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
    system_page_flags_valid_.assign(num_system_page_flags_, 0);
    system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
@@ -3610,24 +3620,18 @@ index ec0df7c8..5b4cdb16 100644
 +  volatile_pages_ = std::make_unique<VolatilePage[]>(kBufferSize >> page_size_log2_);
 +  volatile_page_count_ = 0;
 +  if (volatile_pages_enabled_) {
-+    REXGPU_INFO("Shared memory: pages that keep being rewritten are compared, not write-protected "
++    REXGPU_INFO("Shared memory: pages that keep being rewritten are hashed, not write-protected "
 +                "({} KB pages)",
 +                (uint32_t(1) << page_size_log2_) >> 10);
 +  }
  
    memory_invalidation_callback_handle_ =
        memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
-@@ -82,6 +110,17 @@ void SharedMemory::ShutdownCommon() {
+@@ -82,6 +112,11 @@ void SharedMemory::ShutdownCommon() {
    host_gpu_memory_sparse_allocated_.shrink_to_fit();
    host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
  
 +  // [ps5 port] volatile pages
-+  if (volatile_pages_) {
-+    for (uint32_t page : volatile_shadow_pages_) {
-+      delete[] volatile_pages_[page].shadow;
-+    }
-+  }
-+  volatile_shadow_pages_.clear();
 +  volatile_pages_.reset();
 +  system_page_flags_volatile_.reset();
 +  volatile_page_count_ = 0;
@@ -3635,16 +3639,16 @@ index ec0df7c8..5b4cdb16 100644
    system_page_flags_valid_.clear();
    system_page_flags_valid_.shrink_to_fit();
    system_page_flags_valid_and_gpu_written_.clear();
-@@ -90,6 +129,8 @@ void SharedMemory::ShutdownCommon() {
+@@ -90,6 +125,8 @@ void SharedMemory::ShutdownCommon() {
  }
  
  void SharedMemory::InvalidateAllPages() {
-+  // [ps5 port] (the copies kept of volatile pages say nothing after this)
++  // [ps5 port] (the hashes kept of volatile pages say nothing after this)
 +  volatile_generation_.fetch_add(1, std::memory_order_relaxed);
    auto global_lock = global_critical_region_.Acquire();
  
    std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
-@@ -168,6 +209,30 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
+@@ -168,6 +205,26 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
  
    auto global_lock = global_critical_region_.Acquire();
  
@@ -3658,15 +3662,11 @@ index ec0df7c8..5b4cdb16 100644
 +      if (!IsPageVolatile(page)) {
 +        continue;
 +      }
-+      const bool unchanged_before = VolatilePageUnchanged(page);
++      const uint64_t hash_before = HashGuestPage(page);
++      const bool unchanged_before = IsVolatilePageHash(page, hash_before);
 +      ClearPageVolatile(page);
 +      MakeRangeValid(page << page_size_log2_, uint32_t(1) << page_size_log2_, false);
-+      // (the copy is kept until the command processor next looks at the page;
-+      // its epoch no longer matches, so only this compare still uses it)
-+      const VolatilePage& info = volatile_pages_[page];
-+      if (!unchanged_before || !info.shadow ||
-+          std::memcmp(info.shadow, memory().TranslatePhysical(page << page_size_log2_),
-+                      size_t(1) << page_size_log2_)) {
++      if (!unchanged_before || HashGuestPage(page) != hash_before) {
 +        system_page_flags_valid_[page >> 6] &= ~(uint64_t(1) << (page & 63));
 +      }
 +    }
@@ -3675,7 +3675,7 @@ index ec0df7c8..5b4cdb16 100644
    // Allocate the range.
    WatchRange* range = watch_range_first_free_;
    if (range != nullptr) {
-@@ -306,13 +371,174 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
+@@ -306,13 +363,162 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
        uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
        gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
      }
@@ -3760,16 +3760,18 @@ index ec0df7c8..5b4cdb16 100644
 +  return true;
 +}
 +
-+bool SharedMemory::VolatilePageUnchanged(uint32_t page) const {
++uint64_t SharedMemory::HashGuestPage(uint32_t page) const {
++  return XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_),
++                     size_t(1) << page_size_log2_);
++}
++
++bool SharedMemory::IsVolatilePageHash(uint32_t page, uint64_t hash) const {
 +  const VolatilePage& info = volatile_pages_[page];
-+  return info.shadow && info.shadow_epoch == info.epoch.load(std::memory_order_relaxed) &&
-+         info.shadow_generation == volatile_generation_.load(std::memory_order_relaxed) &&
-+         !std::memcmp(info.shadow, memory().TranslatePhysical(page << page_size_log2_),
-+                      size_t(1) << page_size_log2_);
++  return info.hash == hash && info.hash_epoch == info.epoch.load(std::memory_order_relaxed) &&
++         info.hash_generation == volatile_generation_.load(std::memory_order_relaxed);
 +}
 +
 +void SharedMemory::FilterVolatileUploadRanges() {
-+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
 +  volatile_filtered_ranges_.clear();
 +  auto keep = [this](uint32_t page) {
 +    if (!volatile_filtered_ranges_.empty()) {
@@ -3789,12 +3791,16 @@ index ec0df7c8..5b4cdb16 100644
 +        continue;
 +      }
 +      VolatilePage& info = volatile_pages_[page];
-+      // (read before the page: a copy made now is under this number, and if
-+      // the page stops being volatile meanwhile the copy is never used)
++      // (read before the page: the hash is kept under these numbers, and if
++      // the page stops being volatile meanwhile it is never used)
 +      const uint32_t epoch = info.epoch.load(std::memory_order_relaxed);
 +      const uint32_t generation = volatile_generation_.load(std::memory_order_relaxed);
++      // The hash is taken before the upload reads the page: if the game writes
++      // in between, it is of the older of the two and the next look finds the
++      // difference.
++      const uint64_t hash = HashGuestPage(page);
 +      ++volatile_compares_;
-+      if (VolatilePageUnchanged(page)) {
++      if (IsVolatilePageHash(page, hash)) {
 +        if (++info.quiet_compares < kVolatileQuietCompares) {
 +          // What was uploaded last time: nothing to do.
 +          continue;
@@ -3810,50 +3816,32 @@ index ec0df7c8..5b4cdb16 100644
 +        keep(page);
 +        continue;
 +      }
-+      // Changed, or seen for the first time. The copy is taken before the
-+      // upload reads the page: if the game writes in between, the copy is the
-+      // older of the two and the next compare finds the difference.
-+      if (!info.shadow) {
-+        info.shadow = new uint8_t[page_size];
-+        volatile_shadow_pages_.push_back(page);
-+      }
-+      std::memcpy(info.shadow, memory().TranslatePhysical(page << page_size_log2_), page_size);
-+      info.shadow_epoch = epoch;
-+      info.shadow_generation = generation;
++      // Changed, or seen for the first time.
++      info.hash = hash;
++      info.hash_epoch = epoch;
++      info.hash_generation = generation;
 +      info.quiet_compares = 0;
 +      ++volatile_changed_;
 +      keep(page);
 +    }
-+  }
+   }
 +  upload_ranges_.swap(volatile_filtered_ranges_);
 +
-+  // Every 30 s: a line in the log, and the copies of pages that are no longer
-+  // volatile are given back.
++  // A line in the log every 30 s.
 +  const uint64_t now_ms = VolatileNowMs();
 +  if (now_ms - volatile_stats_ms_ < 30000) {
 +    return;
 +  }
 +  volatile_stats_ms_ = now_ms;
-+  size_t kept = 0;
-+  for (uint32_t page : volatile_shadow_pages_) {
-+    VolatilePage& info = volatile_pages_[page];
-+    if (IsPageVolatile(page)) {
-+      volatile_shadow_pages_[kept++] = page;
-+    } else {
-+      delete[] info.shadow;
-+      info.shadow = nullptr;
-+    }
-   }
-+  volatile_shadow_pages_.resize(kept);
-+  REXGPU_INFO("Shared memory: {} volatile pages ({} copies kept); since the start {} made, {} "
-+              "protected again, {} compares of which {} found a change, {} write faults",
-+              volatile_page_count_.load(std::memory_order_relaxed), kept,
++  REXGPU_INFO("Shared memory: {} volatile pages; since the start {} made, {} protected again, {} "
++              "looks of which {} found a change, {} write faults",
++              volatile_page_count_.load(std::memory_order_relaxed),
 +              volatile_made_.load(std::memory_order_relaxed), volatile_quieted_, volatile_compares_,
 +              volatile_changed_, volatile_faults_.load(std::memory_order_relaxed));
  }
  
  void SharedMemory::UnlinkWatchRange(WatchRange* range) {
-@@ -413,6 +639,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -413,6 +619,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
        uint32_t range_start = UINT32_MAX;
        for (uint32_t i = block_first; i <= block_last; ++i) {
          uint64_t block_valid = system_page_flags_valid_[i];
@@ -3863,7 +3851,7 @@ index ec0df7c8..5b4cdb16 100644
          // Consider pages in the block outside the requested range valid.
          if (i == block_first) {
            uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
-@@ -465,6 +694,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -465,6 +674,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
      return true;
    }
  
@@ -3878,7 +3866,7 @@ index ec0df7c8..5b4cdb16 100644
    return UploadRanges(upload_ranges_);
  }
  
-@@ -494,6 +731,46 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+@@ -494,6 +711,46 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
  
    auto global_lock = global_critical_region_.Acquire();
  
@@ -3925,7 +3913,7 @@ index ec0df7c8..5b4cdb16 100644
    if (!exact_range) {
      // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
      // invalidated - if no GPU-written data nearby that was not intended to be
-@@ -516,6 +793,17 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+@@ -516,6 +773,17 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
      }
    }
  
