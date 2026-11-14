@@ -95,6 +95,17 @@ draws 9.3, transfers 7.4 (the other 4x sections: shadow attenuation and low
 resolution effects, about 1-2 each a frame, each a copy both ways), texture
 loads 4.8, resolves 3.4.
 
+The transfers left are Direct3D's own: with the clears left out
+(`ps5_debug_skip_clears`, a wrong picture) the Linux test build has none.
+`D3D::ClearRect` clears the tile-aligned middle of a rectangle as 4x MSAA at half
+the size over the same memory, and only the edges as the surface is.
+`ps5_lowres_clears = "full"` sends the whole rectangle down Direct3D's own path
+for small rectangles (one `D3D::ClearRects` at the surface's MSAA). On Linux, in
+the save room, culling at 1x: transfers 4.1 ms (8 a frame) -> 1.9 ms (5, none of
+them 1x/4x any more), draws 6.3 -> 6.5 ms, the pictures as close as two runs of
+the same setting. The 5 left are the depth buffer and a colour target over the
+same memory at 1x. Off by default until a console has run it.
+
 ## A frame, as recorded
 
 `ps5/tools/d3d_frame_summary.py logs/d3d_frame_<n>.txt` turns a recorded frame
@@ -137,8 +148,9 @@ stays the default until the native one is better everywhere.
    scenes, and the console's, to come.
 0b. **The depth MSAA trick as what it means**, inside the emulated renderer
    first, since it is most of the cost and needs no new renderer: the lighting's
-   culling at 1x (`ps5_lowres_culling = "full"`, measured above). Next: the
-   remaining 4x sections, then the default once a console agrees.
+   culling at 1x (`ps5_lowres_culling = "full"`, measured above, the default
+   since a console agreed), and Direct3D's clears without 4x
+   (`ps5_lowres_clears = "full"`, off until a console has run it).
 1. **A native frame beside the emulated one**: the same calls drawn natively
    into an image of their own, shown instead of the emulated picture by a
    setting, with Xenia's shader translator and texture code reused for

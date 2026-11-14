@@ -142,7 +142,7 @@ For tests (in `ds2.toml`, on Linux and on the PS5):
 | `ps5/src/ds2_ps5_install.*` | finding and preparing the game from the player's files |
 | `ps5/src/ds2_ps5_framerate.cpp` | 60 FPS: the PC `framerate` mod's two hooks, as the `ps5_frame_rate` setting, and 30 in cutscenes (`ps5_cutscenes_30`) |
 | `ps5/src/ds2_ps5_d3d_trace.cpp` | the game's Direct3D calls recorded (`ps5_d3d_trace`), the first step of `ps5/NATIVE_RENDERER.md` |
-| `ps5/src/ds2_ps5_lowres.cpp` | the game's 4x MSAA "low resolution" sections counted, and the lighting's culling kept at 1x (`ps5_lowres_culling`) |
+| `ps5/src/ds2_ps5_lowres.cpp` | the game's 4x MSAA "low resolution" sections counted, the lighting's culling kept at 1x (`ps5_lowres_culling`, on by default), Direct3D's clears at the surface's own MSAA (`ps5_lowres_clears`) |
 | `ps5/src/ds2_ps5_capture.h`, `ds2_ps5_script.cpp` | for tests: pictures in the logs folder (`ps5_capture`), buttons pressed by themselves (`ps5_input_script`) |
 | `ps5/src/ds2_ps5_linux.cpp`, `ps5/tools/linux_test.sh` | the Linux test build |
 | `ps5/tools/d3d_frame_summary.py` | a recorded frame (`ps5_d3d_trace`) as its passes: render targets, draws, resolves |

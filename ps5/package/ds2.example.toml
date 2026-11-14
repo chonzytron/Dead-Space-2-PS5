@@ -61,13 +61,20 @@
 # needs a copy; "color" or "depth" makes only those of that kind.
 #ps5_edram_transfers = "all"
 
-# Experiment, for performance work: most of those copies come from the
-# lighting's stencil culling, which the game draws at 4x MSAA over the memory
-# of the 1x picture (a quarter of the work on an Xbox 360, two full-screen
-# copies here, about 25 times a frame). "full" draws it at 1x instead, with no
-# copies. If lights look wrong (missing, cut off, or lighting things they
-# shouldn't), set it back to "game".
-#ps5_lowres_culling = "game"
+# Most of those copies came from the lighting's stencil culling, which the
+# game draws at 4x MSAA over the memory of the 1x picture (a quarter of the
+# work on an Xbox 360, two full-screen copies here, 20 to 50 times a frame).
+# "full" draws it at 1x instead, with no copies: at native 4K the worst room
+# measured went from 21 to 33 frames a second. "game" is the Xbox 360's way;
+# set it if lights look wrong (missing, cut off, or lighting things they
+# shouldn't), and say where.
+#ps5_lowres_culling = "full"
+
+# Experiment: the Xbox 360's Direct3D clears most of a surface the same way
+# (as 4x MSAA at half the size), a copy each way here. "full" clears all of it
+# as the surface is: the copies left after the culling's, gone on a PC. Set
+# "game" back if the picture shows leftovers of an earlier frame or flashes.
+#ps5_lowres_clears = "game"
 
 # For the native renderer's work: 1 records the game's Direct3D calls. Every
 # 30 s a line in the log, every 60 s one whole frame call by call in the logs
