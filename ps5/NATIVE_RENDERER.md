@@ -189,6 +189,9 @@ the k_24_8 texture load does (`(n + (n >> 23)) * 2^-24`). The check found it
 byte-identical too. With it, level 2: 28.2 frames a second, resolves 2.8 ms,
 read-backs 3.6 ms (14.2 ms of the two at off).
 
+At `resolution_scale = 3` (the PS5's native 4K) the check found every picture
+identical as well (3840x2160 and 1920x1080, depth included).
+
 What is left of those is the two copies themselves (into the forwarding image
 at the resolve, into the texture at the read-back). Next: one pass, straight
 into the texture.
