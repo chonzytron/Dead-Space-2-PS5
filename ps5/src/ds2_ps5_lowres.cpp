@@ -142,7 +142,7 @@ extern "C" void Displ_EndLowRes_XenonSpecific_8290D848(PPCContext& __restrict ct
 // part aligned to EDRAM tiles, cleared over the same memory as 4x MSAA at half
 // the width and height (four times faster on the Xbox 360; a copy each way
 // here, and on the Linux test build every copy that was left once the culling
-// was at 1x). With "full", the whole rectangle takes Direct3D's own path for
+// was at 1x). With "full" (the default), the whole rectangle takes Direct3D's own path for
 // rectangles too small to split: one D3D::ClearRects of the rectangle as the
 // surface is. The same pixels get the same values, with no 4x.
 //
@@ -151,9 +151,9 @@ extern "C" void Displ_EndLowRes_XenonSpecific_8290D848(PPCContext& __restrict ct
 // +92 / +100 / +108 / +116 the rest) and D3D::ClearRects(device r3, count r4,
 // rectangles r5, colour r6, Z f1, GPU_SURFACEINFO r8, GPU_COLORINFO r9,
 // r10 and +84 two of the rest), as ClearRect itself calls it (0x822360C8).
-REXCVAR_DEFINE_STRING(ps5_lowres_clears, "game", "PS5",
-                      "Direct3D's clears: game (the middle at 4x MSAA over the 1x memory, as on the "
-                      "Xbox 360: copies each way here) or full (all at the surface's own MSAA)");
+REXCVAR_DEFINE_STRING(ps5_lowres_clears, "full", "PS5",
+                      "Direct3D's clears: full (all at the surface's own MSAA) or game (the middle at 4x "
+                      "MSAA over the 1x memory, as on the Xbox 360: copies each way here)");
 
 // For finding out what the copies left are (not to play with: the picture is
 // wrong): ps5_debug_skip_clears = true leaves out the game's Direct3D clears.

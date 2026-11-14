@@ -70,11 +70,12 @@
 # shouldn't), and say where.
 #ps5_lowres_culling = "full"
 
-# Experiment: the Xbox 360's Direct3D clears most of a surface the same way
-# (as 4x MSAA at half the size), a copy each way here. "full" clears all of it
-# as the surface is: the copies left after the culling's, gone on a PC. Set
-# "game" back if the picture shows leftovers of an earlier frame or flashes.
-#ps5_lowres_clears = "game"
+# The Xbox 360's Direct3D clears most of a surface the same way (as 4x MSAA
+# at half the size), a copy each way here. "full" clears all of it as the
+# surface is: in the worst room measured, another 3.5 ms a frame saved at 4K.
+# "game" is the Xbox 360's way; set it if the picture shows leftovers of an
+# earlier frame or flashes, and say where.
+#ps5_lowres_clears = "full"
 
 # For the native renderer's work: 1 records the game's Direct3D calls. Every
 # 30 s a line in the log, every 60 s one whole frame call by call in the logs

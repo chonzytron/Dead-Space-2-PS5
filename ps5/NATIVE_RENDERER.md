@@ -104,7 +104,22 @@ for small rectangles (one `D3D::ClearRects` at the surface's MSAA). On Linux, in
 the save room, culling at 1x: transfers 4.1 ms (8 a frame) -> 1.9 ms (5, none of
 them 1x/4x any more), draws 6.3 -> 6.5 ms, the pictures as close as two runs of
 the same setting. The 5 left are the depth buffer and a colour target over the
-same memory at 1x. Off by default until a console has run it.
+same memory at 1x.
+
+The same room on the PS5 at native 4K, both on (ds2_016), against the culling
+alone (ds2_015), 30 s windows:
+
+| | culling at 1x | and the clears |
+|---|---|---|
+| frames a second | 33.1 | 37.9 (2077 draws a frame); 41.1 (1671) |
+| EDRAM transfers | 7.4 ms, 22 a frame | 3.9 ms, 14 a frame; 3.7 ms, 12 |
+| the game's draws | 9.3 ms | 9.1 ms; 8.4 ms |
+
+No picture showed leftovers or flashes. On by default since. In the 37.9 window
+the GPU was busy 82% of the time; the game's render thread used 95% of a core,
+but almost all of it waiting for the GPU (`D3D::CDevice::BlockOnFence`,
+`D3D::CBlocker::Check`), and the command processor 60%. What is left is the
+GPU's: draws 9.1, texture loads 4.8, transfers 3.9, resolves 3.2 ms.
 
 ## A frame, as recorded
 
@@ -150,7 +165,8 @@ stays the default until the native one is better everywhere.
    first, since it is most of the cost and needs no new renderer: the lighting's
    culling at 1x (`ps5_lowres_culling = "full"`, measured above, the default
    since a console agreed), and Direct3D's clears without 4x
-   (`ps5_lowres_clears = "full"`, off until a console has run it).
+   (`ps5_lowres_clears = "full"`, the default too). The worst room measured,
+   at native 4K: 21.5 -> 38-41 frames a second.
 1. **A native frame beside the emulated one**: the same calls drawn natively
    into an image of their own, shown instead of the emulated picture by a
    setting, with Xenia's shader translator and texture code reused for
