@@ -181,8 +181,17 @@ script (Radeon 760M):
 | resolves | 6.8 ms | 8.9 ms | 3.9 ms |
 | resolved pictures read back | 7.4 ms | 4.5 ms | 4.5 ms |
 
-What is left in both is mostly the depth picture (k_24_8, a float texture made
-from a D24S8 target: it needs a conversion shader, next).
+Depth (D24S8 to a k_24_8 texture, a float texture on the host) is forwarded by
+a compute shader (`src/graphics/shaders/ps5/resolve_forward_depth_unorm24.cs.glsl`
+in the SDK) that does what the two passes it replaces do: the depth quantized to
+24 bits as the EDRAM dump does (round to nearest even), then back to a float as
+the k_24_8 texture load does (`(n + (n >> 23)) * 2^-24`). The check found it
+byte-identical too. With it, level 2: 28.2 frames a second, resolves 2.8 ms,
+read-backs 3.6 ms (14.2 ms of the two at off).
+
+What is left of those is the two copies themselves (into the forwarding image
+at the resolve, into the texture at the read-back). Next: one pass, straight
+into the texture.
 
 ## A frame, as recorded
 

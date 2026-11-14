@@ -848,7 +848,7 @@ index 9d2a8485..b0be86a8 100644
      VkQueryPool query_pool;
      uint32_t first_query;
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 34f70337..f3bc2e48 100644
+index 34f70337..901738ba 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
 @@ -10,6 +10,7 @@
@@ -882,11 +882,20 @@ index 34f70337..f3bc2e48 100644
    bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                                draw_util::ResolveCopyShaderIndex copy_shader,
                                bool draw_resolution_scaled);
+@@ -854,6 +864,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   std::unordered_map<DumpPipelineKey, VkPipeline, DumpPipelineKey::Hasher> dump_pipelines_;
+   VkPipelineLayout direct_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;
+   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
++  // [ps5 port] Resolve forwarding of depth (shaders/ps5/resolve_forward_depth_unorm24.cs.glsl).
++  VkPipeline resolve_forward_depth_pipeline_ = VK_NULL_HANDLE;
+   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
+       direct_resolve_pipelines_;
+ 
 diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
-index 04856ee7..5461c08a 100644
+index 04856ee7..c57a680a 100644
 --- a/include/rex/graphics/vulkan/texture_cache.h
 +++ b/include/rex/graphics/vulkan/texture_cache.h
-@@ -133,6 +133,27 @@ class VulkanTextureCache final : public TextureCache {
+@@ -133,6 +133,33 @@ class VulkanTextureCache final : public TextureCache {
    void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                        uint64_t written_length_scaled);
  
@@ -908,13 +917,19 @@ index 04856ee7..5461c08a 100644
 +  // read through forwarding (for kForwardProofLoads loads in a row), so its
 +  // write to memory can be left out.
 +  bool CanResolveSkipMemory(const draw_util::ResolveInfo& resolve_info) const;
++  // A whole D24S8 picture to a k_24_8 texture: the buffer (one float a pixel,
++  // width_scaled apart) the caller fills before anything reads it - the
++  // render target cache, with a compute shader - or VK_NULL_HANDLE.
++  VkBuffer ForwardResolveDepth(uint32_t width_scaled, uint32_t height_scaled, uint32_t dest_base,
++                               uint32_t dest_length, uint32_t width, uint32_t height,
++                               uint32_t pitch, uint32_t endian, bool memory_skipped);
 +  static constexpr uint32_t kForwardProofLoads = 30;
 +  void ForwardedRangeWritten(uint32_t first, uint32_t last) override;
 +
   protected:
    bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
    bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
-@@ -319,6 +340,50 @@ class VulkanTextureCache final : public TextureCache {
+@@ -319,6 +346,61 @@ class VulkanTextureCache final : public TextureCache {
  
    const HostFormatPair& GetHostFormatPair(TextureKey key) const;
  
@@ -927,7 +942,11 @@ index 04856ee7..5461c08a 100644
 +  struct ForwardedResolve {
 +    VkImage image = VK_NULL_HANDLE;
 +    VkDeviceMemory memory = VK_NULL_HANDLE;
++    // (depth: a buffer of floats instead of an image; format R32_SFLOAT)
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
 +    VkFormat format = VK_FORMAT_UNDEFINED;
++    bool used() const { return image != VK_NULL_HANDLE || buffer != VK_NULL_HANDLE; }
 +    uint32_t width_scaled = 0, height_scaled = 0;
 +    uint32_t dest_base = 0, dest_last = 0, width = 0, height = 0, pitch = 0, guest_format = 0,
 +             endian = 0;
@@ -937,6 +956,7 @@ index 04856ee7..5461c08a 100644
 +    // it is always written); whether the memory was left stale by the last
 +    // resolve.
 +    uint32_t proof_loads = 0;
++    uint32_t checks = 0;  // (ps5_resolve_forward_check: each picture in turn)
 +    bool needs_memory = false;
 +    bool memory_stale = false;
 +    // Set by ForwardResolve, cleared by a write to the range (any thread).
@@ -957,6 +977,12 @@ index 04856ee7..5461c08a 100644
 +  ForwardCheck forward_check_;
 +  ForwardedResolve* forward_check_slot_ = nullptr;  // (set for the load being checked)
 +  void RecordForwardCheck(VulkanTexture& texture, ForwardedResolve& forwarded);
++  // A slot for the picture (the same one as before, or a free one; nullptr if
++  // none), with its bookkeeping updated.
++  ForwardedResolve* GetForwardSlot(VkFormat format, uint32_t width_scaled, uint32_t height_scaled,
++                                   uint32_t dest_base, uint32_t dest_length, uint32_t width,
++                                   uint32_t height, uint32_t pitch, uint32_t guest_format,
++                                   uint32_t endian, bool swap, bool memory_skipped);
 +  void FinishForwardCheck();
 +  static constexpr size_t kForwardedResolveCount = 16;
 +  std::array<ForwardedResolve, kForwardedResolveCount> forwarded_resolves_;
@@ -4081,6 +4107,123 @@ index 76f5600c..e611ea51 100644
    // Mark scaled resolve ranges as non-scaled. Textures themselves will be
    // invalidated by their shared memory watches.
    uint32_t resolve_page_first = address_first >> 12;
+diff --git a/src/graphics/shaders/ps5/resolve_forward_depth_unorm24.cs.glsl b/src/graphics/shaders/ps5/resolve_forward_depth_unorm24.cs.glsl
+new file mode 100644
+index 00000000..184d5cba
+--- /dev/null
++++ b/src/graphics/shaders/ps5/resolve_forward_depth_unorm24.cs.glsl
+@@ -0,0 +1,30 @@
++// [ps5 port] Resolve forwarding of a D24S8 picture to a k_24_8 texture
++// (VulkanRenderTargetCache::ForwardResolveFrom): the depth of a 1x render
++// target, as the k_24_8 texture loads it after a resolve - quantized to 24
++// bits as the EDRAM dump does (round to nearest even), and back to a float as
++// texture_load_depth_unorm does (exact: (n + (n >> 23)) * 2^-24) - one float a
++// pixel, rows width apart. Built into resolve_forward_depth_unorm24_cs.h with
++// glslangValidator -V --vn resolve_forward_depth_unorm24_cs.
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++layout(set = 0, binding = 0, std430) writeonly buffer Destination { float depths[]; };
++layout(set = 1, binding = 0) uniform texture2D source_depth;
++
++layout(push_constant) uniform Constants {
++  uint width;
++  uint height;
++};
++
++void main() {
++  uvec2 position = gl_GlobalInvocationID.xy;
++  if (position.x >= width || position.y >= height) {
++    return;
++  }
++  precise float depth = texelFetch(source_depth, ivec2(position), 0).r;
++  uint unorm24 = uint(roundEven(depth * 16777215.0));
++  precise float loaded = float(unorm24 + (unorm24 >> 23u)) * 5.9604644775390625e-8;
++  depths[position.y * width + position.x] = loaded;
++}
+diff --git a/src/graphics/shaders/ps5/resolve_forward_depth_unorm24_cs.h b/src/graphics/shaders/ps5/resolve_forward_depth_unorm24_cs.h
+new file mode 100644
+index 00000000..617e5896
+--- /dev/null
++++ b/src/graphics/shaders/ps5/resolve_forward_depth_unorm24_cs.h
+@@ -0,0 +1,75 @@
++	// 1116.2.0
++	 #pragma once
++const uint32_t resolve_forward_depth_unorm24_cs[] = {
++	0x07230203,0x00010000,0x0008000b,0x00000058,0x00000000,0x00020011,0x00000001,0x0006000b,
++	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
++	0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x0000000c,0x00060010,0x00000004,
++	0x00000011,0x00000008,0x00000008,0x00000001,0x00030003,0x00000002,0x000001c2,0x000b0004,
++	0x455f4c47,0x735f5458,0x6c706d61,0x656c7265,0x745f7373,0x75747865,0x665f6572,0x74636e75,
++	0x736e6f69,0x00000000,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,0x00000009,
++	0x69736f70,0x6e6f6974,0x00000000,0x00080005,0x0000000c,0x475f6c67,0x61626f6c,0x766e496c,
++	0x7461636f,0x496e6f69,0x00000044,0x00050005,0x00000014,0x736e6f43,0x746e6174,0x00000073,
++	0x00050006,0x00000014,0x00000000,0x74646977,0x00000068,0x00050006,0x00000014,0x00000001,
++	0x67696568,0x00007468,0x00030005,0x00000016,0x00000000,0x00040005,0x0000002d,0x74706564,
++	0x00000068,0x00060005,0x00000030,0x72756f73,0x645f6563,0x68747065,0x00000000,0x00040005,
++	0x00000038,0x726f6e75,0x0034326d,0x00040005,0x0000003e,0x64616f6c,0x00006465,0x00050005,
++	0x00000048,0x74736544,0x74616e69,0x006e6f69,0x00050006,0x00000048,0x00000000,0x74706564,
++	0x00007368,0x00030005,0x0000004a,0x00000000,0x00040047,0x0000000c,0x0000000b,0x0000001c,
++	0x00030047,0x00000014,0x00000002,0x00050048,0x00000014,0x00000000,0x00000023,0x00000000,
++	0x00050048,0x00000014,0x00000001,0x00000023,0x00000004,0x00040047,0x00000030,0x00000021,
++	0x00000000,0x00040047,0x00000030,0x00000022,0x00000001,0x00030047,0x0000003b,0x0000002a,
++	0x00030047,0x00000043,0x0000002a,0x00030047,0x00000046,0x0000002a,0x00040047,0x00000047,
++	0x00000006,0x00000004,0x00030047,0x00000048,0x00000003,0x00040048,0x00000048,0x00000000,
++	0x00000019,0x00050048,0x00000048,0x00000000,0x00000023,0x00000000,0x00030047,0x0000004a,
++	0x00000019,0x00040047,0x0000004a,0x00000021,0x00000000,0x00040047,0x0000004a,0x00000022,
++	0x00000000,0x00040047,0x00000057,0x0000000b,0x00000019,0x00020013,0x00000002,0x00030021,
++	0x00000003,0x00000002,0x00040015,0x00000006,0x00000020,0x00000000,0x00040017,0x00000007,
++	0x00000006,0x00000002,0x00040020,0x00000008,0x00000007,0x00000007,0x00040017,0x0000000a,
++	0x00000006,0x00000003,0x00040020,0x0000000b,0x00000001,0x0000000a,0x0004003b,0x0000000b,
++	0x0000000c,0x00000001,0x00020014,0x0000000f,0x0004002b,0x00000006,0x00000010,0x00000000,
++	0x00040020,0x00000011,0x00000007,0x00000006,0x0004001e,0x00000014,0x00000006,0x00000006,
++	0x00040020,0x00000015,0x00000009,0x00000014,0x0004003b,0x00000015,0x00000016,0x00000009,
++	0x00040015,0x00000017,0x00000020,0x00000001,0x0004002b,0x00000017,0x00000018,0x00000000,
++	0x00040020,0x00000019,0x00000009,0x00000006,0x0004002b,0x00000006,0x00000020,0x00000001,
++	0x0004002b,0x00000017,0x00000023,0x00000001,0x00030016,0x0000002b,0x00000020,0x00040020,
++	0x0000002c,0x00000007,0x0000002b,0x00090019,0x0000002e,0x0000002b,0x00000001,0x00000000,
++	0x00000000,0x00000000,0x00000001,0x00000000,0x00040020,0x0000002f,0x00000000,0x0000002e,
++	0x0004003b,0x0000002f,0x00000030,0x00000000,0x00040017,0x00000033,0x00000017,0x00000002,
++	0x00040017,0x00000035,0x0000002b,0x00000004,0x0004002b,0x0000002b,0x0000003a,0x4b7fffff,
++	0x0004002b,0x00000006,0x00000041,0x00000017,0x0004002b,0x0000002b,0x00000045,0x33800000,
++	0x0003001d,0x00000047,0x0000002b,0x0003001e,0x00000048,0x00000047,0x00040020,0x00000049,
++	0x00000002,0x00000048,0x0004003b,0x00000049,0x0000004a,0x00000002,0x00040020,0x00000054,
++	0x00000002,0x0000002b,0x0004002b,0x00000006,0x00000056,0x00000008,0x0006002c,0x0000000a,
++	0x00000057,0x00000056,0x00000056,0x00000020,0x00050036,0x00000002,0x00000004,0x00000000,
++	0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,0x0004003b,
++	0x0000002c,0x0000002d,0x00000007,0x0004003b,0x00000011,0x00000038,0x00000007,0x0004003b,
++	0x0000002c,0x0000003e,0x00000007,0x0004003d,0x0000000a,0x0000000d,0x0000000c,0x0007004f,
++	0x00000007,0x0000000e,0x0000000d,0x0000000d,0x00000000,0x00000001,0x0003003e,0x00000009,
++	0x0000000e,0x00050041,0x00000011,0x00000012,0x00000009,0x00000010,0x0004003d,0x00000006,
++	0x00000013,0x00000012,0x00050041,0x00000019,0x0000001a,0x00000016,0x00000018,0x0004003d,
++	0x00000006,0x0000001b,0x0000001a,0x000500ae,0x0000000f,0x0000001c,0x00000013,0x0000001b,
++	0x000400a8,0x0000000f,0x0000001d,0x0000001c,0x000300f7,0x0000001f,0x00000000,0x000400fa,
++	0x0000001d,0x0000001e,0x0000001f,0x000200f8,0x0000001e,0x00050041,0x00000011,0x00000021,
++	0x00000009,0x00000020,0x0004003d,0x00000006,0x00000022,0x00000021,0x00050041,0x00000019,
++	0x00000024,0x00000016,0x00000023,0x0004003d,0x00000006,0x00000025,0x00000024,0x000500ae,
++	0x0000000f,0x00000026,0x00000022,0x00000025,0x000200f9,0x0000001f,0x000200f8,0x0000001f,
++	0x000700f5,0x0000000f,0x00000027,0x0000001c,0x00000005,0x00000026,0x0000001e,0x000300f7,
++	0x00000029,0x00000000,0x000400fa,0x00000027,0x00000028,0x00000029,0x000200f8,0x00000028,
++	0x000100fd,0x000200f8,0x00000029,0x0004003d,0x0000002e,0x00000031,0x00000030,0x0004003d,
++	0x00000007,0x00000032,0x00000009,0x0004007c,0x00000033,0x00000034,0x00000032,0x0007005f,
++	0x00000035,0x00000036,0x00000031,0x00000034,0x00000002,0x00000018,0x00050051,0x0000002b,
++	0x00000037,0x00000036,0x00000000,0x0003003e,0x0000002d,0x00000037,0x0004003d,0x0000002b,
++	0x00000039,0x0000002d,0x00050085,0x0000002b,0x0000003b,0x00000039,0x0000003a,0x0006000c,
++	0x0000002b,0x0000003c,0x00000001,0x00000002,0x0000003b,0x0004006d,0x00000006,0x0000003d,
++	0x0000003c,0x0003003e,0x00000038,0x0000003d,0x0004003d,0x00000006,0x0000003f,0x00000038,
++	0x0004003d,0x00000006,0x00000040,0x00000038,0x000500c2,0x00000006,0x00000042,0x00000040,
++	0x00000041,0x00050080,0x00000006,0x00000043,0x0000003f,0x00000042,0x00040070,0x0000002b,
++	0x00000044,0x00000043,0x00050085,0x0000002b,0x00000046,0x00000044,0x00000045,0x0003003e,
++	0x0000003e,0x00000046,0x00050041,0x00000011,0x0000004b,0x00000009,0x00000020,0x0004003d,
++	0x00000006,0x0000004c,0x0000004b,0x00050041,0x00000019,0x0000004d,0x00000016,0x00000018,
++	0x0004003d,0x00000006,0x0000004e,0x0000004d,0x00050084,0x00000006,0x0000004f,0x0000004c,
++	0x0000004e,0x00050041,0x00000011,0x00000050,0x00000009,0x00000010,0x0004003d,0x00000006,
++	0x00000051,0x00000050,0x00050080,0x00000006,0x00000052,0x0000004f,0x00000051,0x0004003d,
++	0x0000002b,0x00000053,0x0000003e,0x00060041,0x00000054,0x00000055,0x0000004a,0x00000018,
++	0x00000052,0x0003003e,0x00000055,0x00000053,0x000100fd,0x00010038
++};
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
 index ec0df7c8..25ca96ba 100644
 --- a/src/graphics/shared_memory.cpp
@@ -5053,7 +5196,7 @@ index 77e61060..abc39793 100644
    const ui::vulkan::VulkanDevice::Functions& dfn = vd->functions();
    const VkDevice device = vd->device();
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f062..82badaef 100644
+index 0298f062..8ee501be 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -21,6 +21,8 @@
@@ -5081,7 +5224,15 @@ index 0298f062..82badaef 100644
  // DEFINE_string(
  //     render_target_path_vulkan, "",
  //     "Render target emulation path to use on Vulkan.\n"
-@@ -180,6 +191,17 @@ const VulkanRenderTargetCache::TransferModeInfo
+@@ -66,6 +77,7 @@ namespace rex::graphics::vulkan {
+ 
+ // Generated with `xb buildshaders`.
+ namespace shaders {
++#include "../shaders/ps5/resolve_forward_depth_unorm24_cs.h"  // [ps5 port]
+ #include "../shaders/vulkan_spirv/host_depth_store_1xmsaa_cs.h"
+ #include "../shaders/vulkan_spirv/host_depth_store_2xmsaa_cs.h"
+ #include "../shaders/vulkan_spirv/host_depth_store_4xmsaa_cs.h"
+@@ -180,6 +192,17 @@ const VulkanRenderTargetCache::TransferModeInfo
          {TransferOutput::kDepth, TransferPipelineLayoutIndex::kDepthAndHostDepthBuffer},
  };
  
@@ -5099,7 +5250,30 @@ index 0298f062..82badaef 100644
  VulkanRenderTargetCache::VulkanRenderTargetCache(const RegisterFile& register_file,
                                                   const memory::Memory& memory,
                                                   uint32_t draw_resolution_scale_x,
-@@ -1145,14 +1167,67 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+@@ -612,6 +635,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+                                         &direct_resolve_pipeline_layout_color_);
+   create_direct_resolve_pipeline_layout(descriptor_set_layout_sampled_image_x2_,
+                                         &direct_resolve_pipeline_layout_depth_);
++  // [ps5 port] Resolve forwarding of depth: the same layout (a storage buffer,
++  // the depth and stencil of a render target, push constants).
++  if (direct_resolve_pipeline_layout_depth_ != VK_NULL_HANDLE) {
++    resolve_forward_depth_pipeline_ = ui::vulkan::util::CreateComputePipeline(
++        vulkan_device, direct_resolve_pipeline_layout_depth_,
++        shaders::resolve_forward_depth_unorm24_cs, sizeof(shaders::resolve_forward_depth_unorm24_cs));
++  }
+ 
+   // Resolve copy pipelines.
+   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount); ++i) {
+@@ -1067,6 +1097,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+   for (VkPipeline& resolve_copy_pipeline : resolve_copy_pipelines_) {
+     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, resolve_copy_pipeline);
+   }
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                         resolve_forward_depth_pipeline_);  // [ps5 port]
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                          resolve_copy_pipeline_layout_);
+ 
+@@ -1145,14 +1177,67 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
      return true;
    }
  
@@ -5168,7 +5342,7 @@ index 0298f062..82badaef 100644
      draw_util::ResolveCopyShaderConstants copy_shader_constants;
      uint32_t copy_group_count_x, copy_group_count_y;
      draw_util::ResolveCopyShaderIndex copy_shader =
-@@ -1291,6 +1366,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+@@ -1291,6 +1376,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
            written_address_out = resolve_info.copy_dest_extent_start;
            written_length_out = resolve_info.copy_dest_extent_length;
            copied = true;
@@ -5182,7 +5356,7 @@ index 0298f062..82badaef 100644
          }
        }
      }
-@@ -1397,8 +1479,52 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+@@ -1397,8 +1489,52 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
        RenderTarget* const* depth_and_color_render_targets =
            last_update_accumulated_render_targets();
  
@@ -5237,7 +5411,7 @@ index 0298f062..82badaef 100644
  
        if (depth_and_color_render_targets[0]) {
          render_pass_key.depth_and_color_used |= 1 << 0;
-@@ -1900,6 +2026,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1900,6 +2036,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
        image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
      }
      image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -5246,19 +5420,30 @@ index 0298f062..82badaef 100644
    }
    if (image_create_info.format == VK_FORMAT_UNDEFINED) {
      REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
-@@ -5971,6 +6099,69 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
+@@ -5971,6 +6109,139 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
    return pipeline;
  }
  
 +VulkanRenderTargetCache::VulkanRenderTarget* VulkanRenderTargetCache::FindWholeForwardSource(
 +    const draw_util::ResolveInfo& resolve_info) {
-+  const draw_util::ResolveEdramInfo& edram = resolve_info.color_edram_info;
++  const bool depth = resolve_info.IsCopyingDepth();
++  const draw_util::ResolveEdramInfo& edram =
++      depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
 +  const reg::RB_COPY_DEST_INFO dest = resolve_info.copy_dest_info;
 +  const draw_util::ResolveCopyDestCoordinateInfo dest_coordinates =
 +      resolve_info.copy_dest_coordinate_info;
-+  if (resolve_info.IsCopyingDepth() || edram.msaa_samples != xenos::MsaaSamples::k1X ||
-+      xenos::ColorRenderTargetFormat(edram.format) != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-+      dest.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest.copy_dest_exp_bias ||
++  // Colour: k_8_8_8_8 to k_8_8_8_8. Depth: D24S8 to k_24_8 (with its shader).
++  const bool formats_forwardable =
++      depth ? (xenos::DepthRenderTargetFormat(edram.format) ==
++                   xenos::DepthRenderTargetFormat::kD24S8 &&
++               // (for depth the field holds the texture format: draw_util::GetResolveInfo)
++               uint32_t(dest.copy_dest_format) == uint32_t(xenos::TextureFormat::k_24_8) &&
++               resolve_forward_depth_pipeline_ != VK_NULL_HANDLE)
++            : (xenos::ColorRenderTargetFormat(edram.format) ==
++                   xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
++               dest.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
++               !dest.copy_dest_exp_bias);
++  if (!formats_forwardable || edram.msaa_samples != xenos::MsaaSamples::k1X ||
 +      dest.copy_dest_array || uint32_t(dest.copy_dest_endian) > 3 ||
 +      dest_coordinates.offset_x_div_8 || dest_coordinates.offset_y_div_8 ||
 +      resolve_info.coordinate_info.edram_offset_x_div_8 ||
@@ -5279,9 +5464,10 @@ index 0298f062..82badaef 100644
 +    return nullptr;
 +  }
 +  const RenderTargetKey key = render_target->key();
-+  if (key.is_depth || key.base_tiles != dump_base || key.msaa_samples != xenos::MsaaSamples::k1X ||
-+      key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-+      key.pitch_tiles_at_32bpp != dump_pitch) {
++  if (bool(key.is_depth) != depth || key.base_tiles != dump_base ||
++      key.msaa_samples != xenos::MsaaSamples::k1X || key.pitch_tiles_at_32bpp != dump_pitch ||
++      (depth ? key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24S8
++             : key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8)) {
 +    return nullptr;
 +  }
 +  return render_target;
@@ -5294,6 +5480,64 @@ index 0298f062..82badaef 100644
 +  const reg::RB_COPY_DEST_INFO dest = resolve_info.copy_dest_info;
 +  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
 +  const uint32_t height = resolve_info.height_div_8 * 8;
++  const uint32_t width_scaled = width * draw_resolution_scale_x();
++  const uint32_t height_scaled = height * draw_resolution_scale_y();
++  const uint32_t dest_length = resolve_info.copy_dest_extent_start +
++                               resolve_info.copy_dest_extent_length - resolve_info.copy_dest_base;
++  if (render_target->key().is_depth) {
++    // Depth: a compute shader reads the render target's depth into the slot's
++    // buffer as the k_24_8 texture would load it.
++    VkBuffer buffer = texture_cache.ForwardResolveDepth(
++        width_scaled, height_scaled, resolve_info.copy_dest_base, dest_length, width, height,
++        resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
++        uint32_t(dest.copy_dest_endian), memory_skipped);
++    if (buffer == VK_NULL_HANDLE) {
++      return;
++    }
++    constexpr VkPipelineStageFlags kStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++    constexpr VkAccessFlags kAccess = VK_ACCESS_SHADER_READ_BIT;
++    constexpr VkImageLayout kLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    command_processor_.PushImageMemoryBarrier(
++        render_target->image(),
++        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
++                                                     VK_IMAGE_ASPECT_STENCIL_BIT),
++        render_target->current_stage_mask(), kStage, render_target->current_access_mask(), kAccess,
++        render_target->current_layout(), kLayout);
++    render_target->SetUsage(kStage, kAccess, kLayout);
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    VkDescriptorSet descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
++        VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
++    if (descriptor_set_dest == VK_NULL_HANDLE) {
++      return;
++    }
++    VkDescriptorBufferInfo buffer_info = {buffer, 0, VK_WHOLE_SIZE};
++    VkWriteDescriptorSet write = {};
++    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write.dstSet = descriptor_set_dest;
++    write.descriptorCount = 1;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    write.pBufferInfo = &buffer_info;
++    vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
++                                                      nullptr);
++    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++    command_processor_.BindExternalComputePipeline(resolve_forward_depth_pipeline_);
++    VkDescriptorSet descriptor_sets[] = {descriptor_set_dest,
++                                         render_target->GetDescriptorSetTransferSource()};
++    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                           direct_resolve_pipeline_layout_depth_, 0, 2,
++                                           descriptor_sets, 0, nullptr);
++    const uint32_t size[2] = {width_scaled, height_scaled};
++    command_buffer.CmdVkPushConstants(direct_resolve_pipeline_layout_depth_,
++                                      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size);
++    command_processor_.SubmitBarriers(true);
++    command_buffer.CmdVkDispatch((width_scaled + 7) / 8, (height_scaled + 7) / 8, 1);
++    command_processor_.PushBufferMemoryBarrier(buffer, 0, VK_WHOLE_SIZE,
++                                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                               VK_ACCESS_SHADER_WRITE_BIT,
++                                               VK_ACCESS_TRANSFER_READ_BIT);
++    return;
++  }
 +  // The render target as the blit's source.
 +  constexpr VkPipelineStageFlags kStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 +  constexpr VkAccessFlags kAccess = VK_ACCESS_TRANSFER_READ_BIT;
@@ -5330,7 +5574,7 @@ index 962ba33e..58802ded 100644
    // ordering barrier.
    Use(Usage::kTransferDestination,
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940d..ec8829cf 100644
+index ecbd940d..2683871b 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -15,6 +15,8 @@
@@ -5357,7 +5601,7 @@ index ecbd940d..ec8829cf 100644
  
  namespace rex::graphics::vulkan {
  
-@@ -437,6 +447,14 @@ VulkanTextureCache::~VulkanTextureCache() {
+@@ -437,6 +447,25 @@ VulkanTextureCache::~VulkanTextureCache() {
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
  
@@ -5367,12 +5611,23 @@ index ecbd940d..ec8829cf 100644
 +      dfn.vkFreeMemory(device, forwarded.memory, nullptr);
 +      forwarded.image = VK_NULL_HANDLE;
 +    }
++    if (forwarded.buffer != VK_NULL_HANDLE) {
++      dfn.vkDestroyBuffer(device, forwarded.buffer, nullptr);
++      dfn.vkFreeMemory(device, forwarded.buffer_memory, nullptr);
++      forwarded.buffer = VK_NULL_HANDLE;
++    }
++  }
++  for (uint32_t i = 0; i < 2; ++i) {
++    if (forward_check_.buffers[i] != VK_NULL_HANDLE) {
++      dfn.vkDestroyBuffer(device, forward_check_.buffers[i], nullptr);
++      dfn.vkFreeMemory(device, forward_check_.memories[i], nullptr);
++    }
 +  }
 +
    for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
      dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
    }
-@@ -527,6 +545,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
+@@ -527,6 +556,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
  
  void VulkanTextureCache::BeginFrame() {
    TextureCache::BeginFrame();
@@ -5380,7 +5635,7 @@ index ecbd940d..ec8829cf 100644
  
    std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
  }
-@@ -1215,8 +1234,33 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+@@ -1215,8 +1245,33 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
  
  bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                 bool load_mips) {
@@ -5414,7 +5669,7 @@ index ecbd940d..ec8829cf 100644
  
    // Get the pipeline.
    const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
-@@ -1783,6 +1827,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1783,6 +1838,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
      copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
    }
  
@@ -5425,7 +5680,7 @@ index ecbd940d..ec8829cf 100644
    return true;
  }
  
-@@ -3258,4 +3306,351 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+@@ -3258,4 +3317,420 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
    return clamp_mode;
  }
  
@@ -5456,69 +5711,78 @@ index ecbd940d..ec8829cf 100644
 +  }
 +}
 +
-+void VulkanTextureCache::ForwardResolve(VkImage src_image, uint32_t width_scaled,
-+                                        uint32_t height_scaled, uint32_t dest_base,
-+                                        uint32_t dest_length, uint32_t width, uint32_t height,
-+                                        uint32_t pitch, uint32_t format, uint32_t endian,
-+                                        bool swap, bool memory_skipped) {
++VulkanTextureCache::ForwardedResolve* VulkanTextureCache::GetForwardSlot(
++    VkFormat format, uint32_t width_scaled, uint32_t height_scaled, uint32_t dest_base,
++    uint32_t dest_length, uint32_t width, uint32_t height, uint32_t pitch, uint32_t guest_format,
++    uint32_t endian, bool swap, bool memory_skipped) {
 +  if (!dest_length) {
-+    return;
++    return nullptr;
 +  }
-+  const VkFormat image_format = swap ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
-+  // The same picture as before, or the least recently used slot.
++  const bool depth = format == VK_FORMAT_R32_SFLOAT;
 +  ForwardedResolve* slot = nullptr;
-+  ForwardedResolve* oldest = nullptr;
++  ForwardedResolve* free_slot = nullptr;
 +  for (ForwardedResolve& forwarded : forwarded_resolves_) {
-+    if (forwarded.image != VK_NULL_HANDLE && forwarded.dest_base == dest_base &&
++    if (forwarded.used() && forwarded.dest_base == dest_base &&
 +        forwarded.width_scaled == width_scaled && forwarded.height_scaled == height_scaled &&
-+        forwarded.format == image_format) {
++        forwarded.format == format) {
 +      slot = &forwarded;
 +      break;
 +    }
-+    if (!oldest || forwarded.last_used < oldest->last_used) {
-+      oldest = &forwarded;
++    if (!forwarded.used() && !free_slot) {
++      free_slot = &forwarded;
 +    }
 +  }
-+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
 +  if (!slot) {
-+    slot = oldest;
-+    if (slot->image != VK_NULL_HANDLE) {
-+      // All taken: the GPU may still be using them, so none is replaced; this
-+      // picture just isn't forwarded.
-+      return;
++    // All taken: the GPU may still be using them, so none is replaced; this
++    // picture just isn't forwarded.
++    if (!free_slot) {
++      return nullptr;
 +    }
-+    VkImageCreateInfo image_create_info = {};
-+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
-+    image_create_info.format = image_format;
-+    image_create_info.extent = {width_scaled, height_scaled, 1};
-+    image_create_info.mipLevels = 1;
-+    image_create_info.arrayLayers = 1;
-+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-+    image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-+            vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-+            slot->image, slot->memory)) {
-+      slot->image = VK_NULL_HANDLE;
-+      REXGPU_WARN("ps5 resolve forwarding: no {}x{} image", width_scaled, height_scaled);
-+      return;
++    slot = free_slot;
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    if (depth) {
++      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++              vulkan_device, VkDeviceSize(width_scaled) * height_scaled * 4,
++              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++              ui::vulkan::util::MemoryPurpose::kDeviceLocal, slot->buffer, slot->buffer_memory)) {
++        slot->buffer = VK_NULL_HANDLE;
++        REXGPU_WARN("ps5 resolve forwarding: no {}x{} depth buffer", width_scaled, height_scaled);
++        return nullptr;
++      }
++    } else {
++      VkImageCreateInfo image_create_info = {};
++      image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++      image_create_info.imageType = VK_IMAGE_TYPE_2D;
++      image_create_info.format = format;
++      image_create_info.extent = {width_scaled, height_scaled, 1};
++      image_create_info.mipLevels = 1;
++      image_create_info.arrayLayers = 1;
++      image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++      image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++      image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++              vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++              slot->image, slot->memory)) {
++        slot->image = VK_NULL_HANDLE;
++        REXGPU_WARN("ps5 resolve forwarding: no {}x{} image", width_scaled, height_scaled);
++        return nullptr;
++      }
 +    }
-+    slot->format = image_format;
++    slot->format = format;
 +    slot->width_scaled = width_scaled;
 +    slot->height_scaled = height_scaled;
-+    REXGPU_INFO("ps5 resolve forwarding: an image for {:08X} ({}x{}, {}x{} scaled, format {}{})",
-+                dest_base, width, height, width_scaled, height_scaled, format,
-+                swap ? ", red and blue swapped" : "");
++    REXGPU_INFO("ps5 resolve forwarding: {} for {:08X} ({}x{}, {}x{} scaled, format {}{})",
++                depth ? "a depth buffer" : "an image", dest_base, width, height, width_scaled,
++                height_scaled, guest_format, swap ? ", red and blue swapped" : "");
 +  }
 +  slot->dest_base = dest_base;
 +  slot->dest_last = dest_base + dest_length - 1;
 +  slot->width = width;
 +  slot->height = height;
 +  slot->pitch = pitch;
-+  slot->guest_format = format;
++  slot->guest_format = guest_format;
 +  slot->endian = endian;
 +  slot->swap = swap;
 +  slot->last_used = ++forwarded_resolve_clock_;
@@ -5528,7 +5792,21 @@ index ecbd940d..ec8829cf 100644
 +                dest_base, width, height);
 +  }
 +  slot->memory_stale = memory_skipped;
++  return slot;
++}
 +
++void VulkanTextureCache::ForwardResolve(VkImage src_image, uint32_t width_scaled,
++                                        uint32_t height_scaled, uint32_t dest_base,
++                                        uint32_t dest_length, uint32_t width, uint32_t height,
++                                        uint32_t pitch, uint32_t format, uint32_t endian,
++                                        bool swap, bool memory_skipped) {
++  ForwardedResolve* slot =
++      GetForwardSlot(swap ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, width_scaled,
++                     height_scaled, dest_base, dest_length, width, height, pitch, format, endian,
++                     swap, memory_skipped);
++  if (!slot) {
++    return;
++  }
 +  // (the image was last read by a copy, or never used: its contents don't matter)
 +  command_processor_.PushImageMemoryBarrier(
 +      slot->image, ui::vulkan::util::InitializeSubresourceRange(), VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -5550,6 +5828,25 @@ index ecbd940d..ec8829cf 100644
 +  slot->current.store(true, std::memory_order_release);
 +}
 +
++VkBuffer VulkanTextureCache::ForwardResolveDepth(uint32_t width_scaled, uint32_t height_scaled,
++                                                 uint32_t dest_base, uint32_t dest_length,
++                                                 uint32_t width, uint32_t height, uint32_t pitch,
++                                                 uint32_t endian, bool memory_skipped) {
++  ForwardedResolve* slot = GetForwardSlot(
++      VK_FORMAT_R32_SFLOAT, width_scaled, height_scaled, dest_base, dest_length, width, height,
++      pitch, uint32_t(xenos::TextureFormat::k_24_8), endian, false, memory_skipped);
++  if (!slot) {
++    return VK_NULL_HANDLE;
++  }
++  // (the buffer was last read by a copy, or never used)
++  command_processor_.PushBufferMemoryBarrier(
++      slot->buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++      VK_ACCESS_SHADER_WRITE_BIT);
++  slot->current.store(true, std::memory_order_release);
++  return slot->buffer;
++}
++
 +bool VulkanTextureCache::LoadForwardedResolve(VulkanTexture& texture) {
 +  const TextureKey key = texture.key();
 +  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
@@ -5558,7 +5855,7 @@ index ecbd940d..ec8829cf 100644
 +  }
 +  const uint32_t base = key.base_page << 12;
 +  for (ForwardedResolve& forwarded : forwarded_resolves_) {
-+    if (forwarded.image == VK_NULL_HANDLE ||
++    if (!forwarded.used() ||
 +        !forwarded.current.load(std::memory_order_acquire) || forwarded.dest_base != base ||
 +        forwarded.width != key.GetWidth() || forwarded.height != key.GetHeight() ||
 +        forwarded.pitch != key.pitch * 32 || forwarded.guest_format != uint32_t(key.format) ||
@@ -5566,13 +5863,25 @@ index ecbd940d..ec8829cf 100644
 +      continue;
 +    }
 +    const HostFormatPair& host_format_pair = GetHostFormatPair(key);
-+    if (host_format_pair.format_unsigned.format != VK_FORMAT_R8G8B8A8_UNORM ||
++    const VkFormat texture_format = forwarded.buffer != VK_NULL_HANDLE ? VK_FORMAT_R32_SFLOAT
++                                                                        : VK_FORMAT_R8G8B8A8_UNORM;
++    if (host_format_pair.format_unsigned.format != texture_format ||
 +        forwarded.width_scaled != key.GetWidth() * draw_resolution_scale_x() ||
 +        forwarded.height_scaled != key.GetHeight() * draw_resolution_scale_y()) {
 +      return false;
 +    }
 +    static const bool check = REXCVAR_GET(ps5_resolve_forward_check);
-+    if (check && !forward_check_.pending && rex::ps5diag::NowMs() >= forward_check_.next_ms) {
++    uint32_t fewest_checks = UINT32_MAX;
++    if (check) {
++      for (const ForwardedResolve& other : forwarded_resolves_) {
++        if (other.used() && other.current.load(std::memory_order_relaxed)) {
++          fewest_checks = std::min(fewest_checks, other.checks);
++        }
++      }
++    }
++    if (check && !forward_check_.pending && rex::ps5diag::NowMs() >= forward_check_.next_ms &&
++        forwarded.checks <= fewest_checks) {
++      ++forwarded.checks;
 +      // Loaded as before this time, and compared (RecordForwardCheck).
 +      forward_check_slot_ = &forwarded;
 +      return false;
@@ -5594,13 +5903,23 @@ index ecbd940d..ec8829cf 100644
 +          texture_old_layout, texture_new_layout);
 +    }
 +    command_processor_.SubmitBarriers(true);
-+    VkImageCopy copy = {};
-+    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-+    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-+    copy.extent = {forwarded.width_scaled, forwarded.height_scaled, 1};
-+    command_processor_.deferred_command_buffer().CmdVkCopyImage(
-+        forwarded.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image(),
-+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
++    if (forwarded.buffer != VK_NULL_HANDLE) {
++      VkBufferImageCopy copy = {};
++      copy.bufferRowLength = forwarded.width_scaled;
++      copy.bufferImageHeight = forwarded.height_scaled;
++      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++      copy.imageExtent = {forwarded.width_scaled, forwarded.height_scaled, 1};
++      command_processor_.deferred_command_buffer().CmdVkCopyBufferToImage(
++          forwarded.buffer, texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
++    } else {
++      VkImageCopy copy = {};
++      copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++      copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++      copy.extent = {forwarded.width_scaled, forwarded.height_scaled, 1};
++      command_processor_.deferred_command_buffer().CmdVkCopyImage(
++          forwarded.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image(),
++          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
++    }
 +    forwarded.last_used = ++forwarded_resolve_clock_;
 +    if (forwarded.proof_loads < kForwardProofLoads) ++forwarded.proof_loads;
 +#if REX_PS5_PROGRAM
@@ -5652,8 +5971,13 @@ index ecbd940d..ec8829cf 100644
 +  region.imageExtent = {forwarded.width_scaled, forwarded.height_scaled, 1};
 +  command_buffer.CmdVkCopyImageToBuffer(texture.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 +                                        check.buffers[0], region);
-+  command_buffer.CmdVkCopyImageToBuffer(forwarded.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-+                                        check.buffers[1], region);
++  if (forwarded.buffer != VK_NULL_HANDLE) {
++    VkBufferCopy buffer_copy = {0, 0, size};
++    command_buffer.CmdVkCopyBuffer(forwarded.buffer, check.buffers[1], 1, &buffer_copy);
++  } else {
++    command_buffer.CmdVkCopyImageToBuffer(forwarded.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                          check.buffers[1], region);
++  }
 +  command_processor_.PushImageMemoryBarrier(
 +      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
 +      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
@@ -5749,7 +6073,7 @@ index ecbd940d..ec8829cf 100644
 +  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
 +  const uint32_t height = resolve_info.height_div_8 * 8;
 +  for (const ForwardedResolve& forwarded : forwarded_resolves_) {
-+    if (forwarded.image != VK_NULL_HANDLE && forwarded.dest_base == resolve_info.copy_dest_base &&
++    if (forwarded.used() && forwarded.dest_base == resolve_info.copy_dest_base &&
 +        forwarded.width == width && forwarded.height == height &&
 +        forwarded.swap == (resolve_info.copy_dest_info.copy_dest_swap != 0) &&
 +        forwarded.endian == uint32_t(resolve_info.copy_dest_info.copy_dest_endian)) {
@@ -5762,7 +6086,7 @@ index ecbd940d..ec8829cf 100644
 +void VulkanTextureCache::NoteUnforwardedResolvedLoad(const TextureKey& key, uint32_t size) {
 +  const uint32_t first = key.base_page << 12, last = first + std::max(size, UINT32_C(1)) - 1;
 +  for (ForwardedResolve& forwarded : forwarded_resolves_) {
-+    if (forwarded.image == VK_NULL_HANDLE || first > forwarded.dest_last ||
++    if (!forwarded.used() || first > forwarded.dest_last ||
 +        last < forwarded.dest_base || forwarded.needs_memory) {
 +      continue;
 +    }
