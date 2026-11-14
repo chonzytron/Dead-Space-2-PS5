@@ -121,6 +121,27 @@ but almost all of it waiting for the GPU (`D3D::CDevice::BlockOnFence`,
 `D3D::CBlocker::Check`), and the command processor 60%. What is left is the
 GPU's: draws 9.1, texture loads 4.8, transfers 3.9, resolves 3.2 ms.
 
+## What a native renderer would save
+
+Texture loads are timed in two parts since (`ps5 gpu:` "of them resolved pictures
+read back"). On the Linux test build at `resolution_scale = 2`, all of a frame's
+texture loads were resolved pictures (7.0 of 7.1 ms, and 7.4 of 7.4): the game's
+own textures load once; what loads every frame is the emulated EDRAM's output,
+written to guest memory by a resolve, then untiled back into a texture. So in the
+heavy room on the PS5 at 4K (ds2_016, 21.6 ms of GPU work in the 37.9 window):
+
+| | ms | in a native renderer |
+|---|---|---|
+| EDRAM transfers | 3.9 | none: no EDRAM |
+| resolves | 3.2 | an image copy, or none where the target is read as it is |
+| resolved pictures read back | 4.8 (all of the texture loads) | none |
+| the game's draws | 9.1 | the same: the same shaders |
+
+About 12 of the 21 ms is the EDRAM's emulation. What a native renderer has to
+do differently is in render targets, resolves and the textures made from them;
+the draws, shaders, vertex and constant data and the game's own textures can be
+the emulated renderer's as they are.
+
 ## A frame, as recorded
 
 `ps5/tools/d3d_frame_summary.py logs/d3d_frame_<n>.txt` turns a recorded frame
