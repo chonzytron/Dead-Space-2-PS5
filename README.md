@@ -1,5 +1,3 @@
-![Dead Space 2](ps5/background.jpg)
-
 # Dead Space 2 for PS5
 
 The Xbox 360 version of Dead Space 2 (Title Update 2), running natively on a jailbroken PS5 as a
