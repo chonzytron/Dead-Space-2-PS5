@@ -1,0 +1,187 @@
+# Dead Space 2 for PS5 - settings.
+#
+# Copy this file to ds2.toml (next to it, in the app's folder) and remove the
+# "#" in front of a line to change that setting. Without a ds2.toml the app
+# uses the values shown here. A line the app doesn't understand is ignored.
+
+# The game's language: "auto" follows the PS5's. The World (En,Fr,Es) discs
+# have English and French voices, and Spanish text with English voices.
+#ps5_language = "auto"          # auto, english, french, spanish
+
+# Frames a second the game aims for: 60, or 30, the game as it shipped on the
+# Xbox 360. Set 30 if something looks or plays wrong at 60.
+#ps5_frame_rate = 60
+
+# At 60, some things in cutscenes happen early (as in the PC release: in the
+# intro, the room's lights come on 18 s early), so the game goes back to its
+# own 30 while a cutscene has hold of Isaac, and to 60 when it is over. A
+# sequence you play rather than watch stays at 60: hacking, and any in which
+# the controller does something new (a button, Start and Back aside, or a
+# stick pushed). false: 60 in cutscenes too, early bits and all.
+#ps5_cutscenes_30 = true
+
+# Adaptive vsync: a frame that is a little late is shown as soon as it is
+# ready. false is the Xbox 360's way: it waits for the next refresh, so a
+# frame that takes 17 ms is shown after 33 and 60 frames a second become 30.
+# Set false if the game's speed or its motion seems wrong.
+#vsync_adaptive = true
+
+# Faster tracking of the graphics data the game rewrites every frame (moving
+# characters, effects). New and untested: set false if geometry flickers,
+# stretches or is left behind where it was a moment ago.
+#shared_memory_volatile_pages = true
+
+# A frames-a-second counter in the top right corner of the picture.
+#ps5_show_fps = false
+
+# The TV mode the picture is sent in: 2160 (4K), 1440 or 1080. The picture
+# the game draws (resolution_scale, below) is scaled to it.
+#ps5_display_height = 2160
+
+# The resolution the game is drawn at, in times the Xbox 360's 1280x720:
+# 1 = 1280x720, 2 = 2560x1440, 3 = 3840x2160 (native 4K). Each step is a lot
+# more work for the graphics chip (2 is four times the pixels of 1, 3 is nine
+# times). If the frame rate dips, the log's "gpu busy" says whether this is
+# why: near 100%, the graphics chip is the limit.
+#resolution_scale = 3
+
+# Sound queued ahead of the speakers, in 5.3 ms frames (4 to 64). Fewer is
+# less delay between picture and sound, but may crackle.
+#audio_maxqframes = 8
+
+# The progress screen of the first start, while the game's files are prepared
+# (unpacking Severed takes a few minutes). false: no screen, only a PS5
+# notification; try it if the app stays black and never reaches the game.
+# Later starts don't show it: the game starts straight away, as long as the
+# install folder holds the same files as at the first start (a file added,
+# removed or replaced there makes it prepare again).
+#ps5_prepare_screen = true
+
+# At the end of that first start, the files in the install folder the game no
+# longer needs once prepared (the title update package, the Severed package)
+# are listed on the screen: Cross deletes them, Circle keeps them. The disc
+# images always stay (the game reads from them). "keep": never ask; "delete":
+# delete them without asking.
+#ps5_install_cleanup = "ask"
+
+# Skip the EA and Visceral Games logos at start-up: the title screen is up in
+# 2 s instead of 16, and everything after it is as after the logos.
+#ps5_skip_intro_videos = false
+
+# The log (in the app's logs folder): info, debug or trace say more.
+#log_level = "info"
+
+# Experiment, for performance work: the copies the emulator makes when the
+# game switches the Xbox 360's EDRAM from one surface to another ("EDRAM
+# transfers" in the profile). "all" makes every one, as it should; "none"
+# skips them all, which is faster and will show wrong pictures where the game
+# needs a copy; "color" or "depth" makes only those of that kind.
+#ps5_edram_transfers = "all"
+
+# Most of those copies came from the lighting's stencil culling, which the
+# game draws at 4x MSAA over the memory of the 1x picture (a quarter of the
+# work on an Xbox 360, two full-screen copies here, 20 to 50 times a frame).
+# "full" draws it at 1x instead, with no copies: at native 4K the worst room
+# measured went from 21 to 33 frames a second. "game" is the Xbox 360's way;
+# set it if lights look wrong (missing, cut off, or lighting things they
+# shouldn't), and say where.
+#ps5_lowres_culling = "full"
+
+# The Xbox 360's Direct3D clears most of a surface the same way (as 4x MSAA
+# at half the size), a copy each way here. "full" clears all of it as the
+# surface is: in the worst room measured, another 3.5 ms a frame saved at 4K.
+# "game" is the Xbox 360's way; set it if the picture shows leftovers of an
+# earlier frame or flashes, and say where.
+#ps5_lowres_clears = "full"
+
+# For the native renderer's work: 1 records the game's Direct3D calls. Every
+# 30 s a line in the log, every 60 s one whole frame call by call in the logs
+# folder (d3d_frame_<n>.txt), and each shader the game creates
+# (d3d_shaders.txt). A little slower while a frame is recorded.
+#ps5_d3d_trace = 0
+
+# For tests: the game's picture every this many seconds in the logs folder
+# (capture_<n>.bmp, at most 1280 wide), to send with a log. 0: never (no
+# screenshots).
+#ps5_capture = 0
+
+# For tests: buttons pressed by themselves at those seconds, e.g. through the
+# menus into the last save: "6:start 10:start 14:start 18:start 22:start
+# 26:start 30:start 34:start 38:start 42:a 50:a". Leave it empty to play.
+#ps5_input_script = ""
+
+# Native resolves (at resolution_scale 2 or 3). The pictures the game copies
+# out of its render targets reach the textures that read them directly,
+# instead of through the Xbox 360's memory layout and back; and once only
+# those textures read them, they aren't written to memory at all (the log says
+# so, and if anything else reads one later, it is written again). With the
+# setting below: the worst room measured at native 4K went from 38 to 54
+# frames a second. 1: directly, but still written to memory. 0: as the Xbox
+# 360 does it; set it if a picture flickers, shows an old frame or looks wrong
+# somewhere, and say where.
+#ps5_resolve_forward = 2
+
+# The emulator takes the game's full-screen drawing to reach far below the
+# picture, and then copies the depth buffer and the picture over each other
+# every time. true bounds it by the viewport the game set: no such copies left
+# in the worst room measured. false: the emulator's own estimate; set it if
+# the bottom of the picture shows something old or wrong, and say where.
+#ps5_draw_extent_from_viewport = true
+
+# true: at the end of every frame the emulator forgets which of the game's
+# memory it has already given the graphics chip, and gives it all again the
+# next frame (every model's vertices, changed or not), as the SDK came. The
+# game's writes are caught anyway (its pages are watched), so false gives again
+# only what the game changed: in the action scenes, 13 to 17 MB a frame became
+# 1.6 to 3 MB, and the worst 10 s went from 52 to 55 frames a second. Set true
+# if something is drawn where it was a moment ago, stretched, or not updated,
+# and say where.
+#clear_memory_page_state = false
+
+# A draw that uses the same textures as the draw before it reuses its texture
+# list for the graphics chip instead of writing a new one (the emulator wrote
+# one for every draw; scenes with 4,500 draws a frame spent 4 ms of the
+# emulator's thread on it). Changes nothing you can see; if a texture looks
+# wrong (on the wrong object, or missing), set false and say where.
+#ps5_reuse_texture_bindings = true
+
+# The graphics commands of a frame are written down first and turned into the
+# graphics chip's own commands at the end (the driver's work, about 2 us a
+# draw: 6-10 ms in the busiest frames, all at the frame's end). With this on,
+# a second thread does that, and a frame with many draws is handed over in
+# parts of ps5_submit_chunk_draws draws, so it happens while the rest of the
+# frame is made. Changes nothing you can see; if anything flickers, is missing,
+# or the game stops, set false and say where.
+#ps5_submit_thread = true
+#ps5_submit_chunk_draws = 300
+
+# A page of memory the game keeps rewriting is looked at (hashed) each time a
+# draw uses it. With this on, once for each batch of commands the game hands
+# the graphics chip instead. Being tested; if geometry jumps, stretches or
+# flickers, set false and say where.
+#ps5_volatile_look_once = false
+
+# For performance work only, when a log is being recorded to find out what
+# limits the frame rate: every 30 s the log gets, for each busy thread, how
+# much of a processor core it used and where it spent the time. To find that
+# out it stops every thread 100 times a second to see what it is doing, and
+# that slows the game a little (a few percent). Leave it off to play.
+#ps5_profile = false
+
+# Every 10 s, a line in the log with the frame rate, how busy the graphics
+# chip was, and other progress counters; and where every thread is when the
+# game stops drawing. Costs next to nothing; leave on while the port is young.
+#ps5_diag_monitor = true
+
+# The detailed performance lines in the log: the reports every 10 s and of
+# each slow frame, each graphics pipeline made, and the like. false for a quiet
+# log (errors, warnings and a report if the game stops drawing are still
+# written; the log then holds little more than the start-up).
+#ps5_perf_log = true
+
+# The game's Direct3D waits for the graphics chip by checking again and again
+# without a pause, which keeps a whole processor core busy all the time; on the
+# PS5 that core is shared with another busy thread. With this on, each check
+# is preceded by a short pause that leaves the core to the other thread.
+# Changes nothing you can see; if the game stutters or stops, set false.
+#ps5_gentle_gpu_waits = true
