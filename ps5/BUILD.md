@@ -66,6 +66,11 @@ outside the repository. `.claude/settings.json` allows this one command, so that
 can build and package the port. The file is only read by a session that has this
 repository alone, started from a branch that contains it.
 
+`ps5/tools/make_source_zip.sh` packs only the repository files this build reads into
+`out/DeadSpace2-PS5-src-<version>.zip`: `src_tu2/` without the generator's metadata, the
+disc-swap code shared with the PC app, `sdk/`'s pin and patches, the build and packaging
+parts of `ps5/`, and `.claude/settings.json`. Unpacked, it builds like a full checkout.
+
 | Option | Effect |
 |---|---|
 | `-DDS2_PS5_THINLTO=ON` | ThinLTO across the whole program (slower link, faster game code). Off by default. |
@@ -211,6 +216,13 @@ check finds them (a check that needs the real linker).
 
 That shows the code compiles for the PS5 and that its parts fit together. It is not a
 link: the port has not been linked with the PS5 toolchain or run on a console yet.
+
+## Porting another game
+
+`docs/ps5-porting/CLAUDE.md` is a guide for porting other Xbox 360 recompilations the same
+way: the reference repos and pinned toolchain commits, the files to read first, the PS5
+platform facts the layer handles, performance lessons from the GTA IV port, and the checks
+that need no console. Copy it into a new porting repo as `CLAUDE.md`.
 
 ## Licence
 
